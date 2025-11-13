@@ -1,3 +1,8 @@
+//! ComfyUI backend communication and request/response handling
+//!
+//! This module handles the translation between OpenAI API format and ComfyUI format,
+//! manages image generation requests, and retrieves generated images from the backend.
+
 use axum::{
     body::{Body, Bytes},
     extract::{Query, State},
@@ -15,38 +20,62 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs;
 use std::path::Path;
 
+/// Metadata for an image file from ComfyUI output
+///
+/// Used to construct the query string for retrieving images from the backend
 #[derive(Debug, Clone, Serialize)]
 struct ImageFile {
+    /// Image filename in the ComfyUI output directory
     filename: String,
+    /// Subdirectory within the output folder
     subfolder: String,
+    /// Image type (e.g., "output", "temp")
     #[serde(rename = "type")]
     type_field: String,
 }
 
-/// Loads all JSON files from a directory and returns them as a map
-/// where the key is the filename without extension and the value is the parsed JSON
-pub struct PipelinesLoader;
+/// Loads ComfyUI workflow (workflow) JSON files from a directory
+///
+/// Workflows are definitions that describe the image generation process.
+/// Each workflow is a JSON file that can be referenced by model name in API requests.
+pub struct WorkflowsLoader;
 
-impl PipelinesLoader {
-    /// Load all .json files from the specified folder path
-    /// Returns a HashMap with filename (without extension) -> JSON content
+impl WorkflowsLoader {
+    /// Loads all .json files from the specified folder
+    ///
+    /// Scans the directory and loads all JSON files, using the filename (without extension)
+    /// as the key. This allows clients to reference workflows by name in their requests.
+    ///
+    /// # Arguments
+    /// * `folder_path` - Path to directory containing workflow JSON files
+    ///
+    /// # Returns
+    /// - HashMap with workflow name -> JSON content
+    /// - Error if directory doesn't exist, is invalid, or JSON parsing fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// let workflows = WorkflowsLoader::load_from_folder("./workflows")?;
+    /// // Access workflow with: workflows.get("animagine-xl-4")
+    /// ```
     pub fn load_from_folder(folder_path: &str) -> Result<HashMap<String, Value>, String> {
         let path = Path::new(folder_path);
         
-        // Check if the folder exists
+        // Validate that the folder exists
         if !path.exists() {
-            return Err(format!("Pipelines folder does not exist: {}", folder_path));
+            return Err(format!("Workflows folder does not exist: {}", folder_path));
         }
         
+        // Validate that the path is a directory
         if !path.is_dir() {
-            return Err(format!("Pipelines path is not a directory: {}", folder_path));
+            return Err(format!("Workflows path is not a directory: {}", folder_path));
         }
         
-        let mut pipelines = HashMap::new();
+        let mut workflows = HashMap::new();
         
         // Read all entries in the directory
         let entries = fs::read_dir(path)
-            .map_err(|e| format!("Failed to read pipelines directory: {}", e))?;
+            .map_err(|e| format!("Failed to read workflows directory: {}", e))?;
         
         for entry in entries {
             let entry = entry
@@ -59,7 +88,7 @@ impl PipelinesLoader {
                 .map(|ext| ext.eq_ignore_ascii_case("json"))
                 .unwrap_or(false)
             {
-                // Get the filename without extension
+                // Extract filename without extension (used as workflow name)
                 let filename = file_path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -68,30 +97,40 @@ impl PipelinesLoader {
                     })?
                     .to_string();
                 
-                // Read and parse the JSON file
+                // Read the JSON file contents
                 let file_content = fs::read_to_string(&file_path)
                     .map_err(|e| {
                         format!("Failed to read JSON file {}: {}", file_path.display(), e)
                     })?;
                 
+                // Parse the JSON
                 let json_value: Value = serde_json::from_str(&file_content)
                     .map_err(|e| {
                         format!("Failed to parse JSON from {}: {}", file_path.display(), e)
                     })?;
                 
-                info!("✅ Loaded pipeline: {}", filename);
-                pipelines.insert(filename, json_value);
+                info!("✅ Loaded workflow: {}", filename);
+                workflows.insert(filename, json_value);
             }
         }
         
-        info!("📦 Successfully loaded {} pipeline(s)", pipelines.len());
-        Ok(pipelines)
+        info!("📦 Successfully loaded {} workflow(s)", workflows.len());
+        Ok(workflows)
     }
 }
 
 use crate::proxy::{ProxyState, ProxyError, handle_request_error, handle_timeout_error};
 
-
+/// Handles OpenAI API image generation requests and proxies them to ComfyUI
+///
+/// This is the main entry point for image generation requests from clients.
+/// It:
+/// 1. Reads the OpenAI format request
+/// 2. Translates it to ComfyUI format
+/// 3. Sends it to the backend
+/// 4. Waits for job completion via WebSocket
+/// 5. Retrieves and encodes generated images
+/// 6. Returns them in OpenAI API format
 pub async fn generations_response(
     State(state): State<Arc<ProxyState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -99,15 +138,14 @@ pub async fn generations_response(
     body: Body,
 ) -> Result<AxumResponse, ProxyError> {
 
-    // Set the backend target endpoint
+    // Construct the backend ComfyUI URL for prompt submission
     let target_base: String = format!("{}:{}", state.backend_url, state.backend_port);
     let method = Method::POST;
-    // Append the target path
     let target_url: String = format!("http://{}/prompt", target_base);
 
     debug!("🎯 Proxying {} / -> {}", method, target_url);
 
-    // Build query string, if any, after the backend path (not really tested)
+    // Build query string from parameters (rarely used but preserved for compatibility)
     let query_string = if params.is_empty() {
         String::new()
     } else {
@@ -125,7 +163,7 @@ pub async fn generations_response(
     };
     let full_url = format!("{}{}", target_url, query_string);
 
-    // Read body of the request, up to the given number of MBs
+    // Read the request body up to the configured maximum size
     debug!("📥 Reading request body...");
     let body_bytes = match axum::body::to_bytes(body, state.max_payload_size_mb * 1024 * 1024).await
     {
@@ -142,12 +180,12 @@ pub async fn generations_response(
         }
     };
 
-    // There is some body here, construct the comfyui request
+    // Transform OpenAI API request format to ComfyUI format
     let processed_body = if !body_bytes.is_empty() {
         debug!("🔧 Generating comfyui request body...");
         match create_json_payload(
             body_bytes,
-            state.pipelines.clone(),
+            state.workflows.clone(),
             state.backend_client_id.clone(),
         )
         .await
@@ -165,11 +203,11 @@ pub async fn generations_response(
         body_bytes
     };
 
-    // Prepare headers
+    // Prepare HTTP headers for the backend request
     debug!("📋 Preparing headers...");
     let mut upstream_headers = reqwest::header::HeaderMap::new();
 
-    // Only add content-type if we have a body
+    // Set content-type for JSON payload
     if !processed_body.is_empty() {
         upstream_headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -177,14 +215,14 @@ pub async fn generations_response(
         );
     }
 
-    // Add authorization header if present in original request
+    // Forward authorization headers if present
     if let Some(auth) = headers.get("authorization") {
         if let Ok(auth_value) = reqwest::header::HeaderValue::from_bytes(auth.as_bytes()) {
             upstream_headers.insert(reqwest::header::AUTHORIZATION, auth_value);
         }
     }
 
-    // Debug: Print all headers being sent
+    // Log headers for debugging
     debug!("📋 Headers to send:");
     for (name, value) in upstream_headers.iter() {
         debug!("   {}: {}", name, value.to_str().unwrap_or("[unprintable]"));
@@ -194,21 +232,16 @@ pub async fn generations_response(
     debug!("   Method: {}", method);
     debug!("   Body size: {} bytes", processed_body.len());
 
-    // Build request
+    // Build the request to the backend
     let request_builder = state
-        // set client
         .client
-        // add method and endpoint
         .request(method.clone(), &full_url)
-        // add headers
         .headers(upstream_headers)
-        // add body
         .body(processed_body);
 
     debug!("⏳ Sending request to backend...");
-    debug!("🔍 About to call request_builder.send()...");
 
-    // Add a timeout wrapper to catch hanging requests
+    // Send request with timeout protection
     let request_future = request_builder.send();
     let timeout_duration = Duration::from_secs(state.timeout);
 
@@ -217,7 +250,7 @@ pub async fn generations_response(
         timeout_duration.as_secs()
     );
 
-    // Await the request future
+    // Execute request with timeout
     let upstream_response = match tokio::time::timeout(timeout_duration, request_future).await {
         Ok(Ok(response)) => {
             debug!(
@@ -235,8 +268,8 @@ pub async fn generations_response(
         }
     };
 
-    // Check if it is a streaming request
-    let is_streaming = upstream_response
+    // Detect response type (streaming responses are not yet supported)
+    let _is_streaming = upstream_response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -247,13 +280,7 @@ pub async fn generations_response(
         })
         .unwrap_or(false);
 
-    println!(
-        "📦 Response type: {}",
-        if is_streaming { "streaming" } else { "regular" }
-    );
-
-
-    // Handle a regular response
+    // Handle the response from ComfyUI
     handle_regular_response(
         upstream_response,
         target_base, 
@@ -266,104 +293,117 @@ pub async fn generations_response(
 
 
 
-/// Modifies the json payload of a openAI image request to adapt it to ComfyUI
+/// Transforms an OpenAI API request into a ComfyUI prompt request
+///
+/// This function performs the critical translation layer between the OpenAI image
+/// generation API format and ComfyUI's workflow format.
+///
+/// Mapping:
+/// - `model` -> workflow name (used to look up workflow JSON)
+/// - `prompt` -> positive prompt text for image generation
+/// - `negative_prompt` -> negative prompt for image generation
+/// - `size` -> image dimensions (e.g., "1024x1024" -> width/height)
+/// - `n` -> batch_size (number of images to generate)
+///
+/// # Arguments
+/// * `body` - Raw request body from OpenAI API call
+/// * `workflows` - Map of available ComfyUI workflows definitions
+/// * `client_id` - Client ID for WebSocket tracking
+///
+/// # Returns
+/// - Serialized ComfyUI prompt JSON ready for backend submission
+/// - ProxyError if validation or transformation fails
 async fn create_json_payload(
     body: Bytes,
-    pipelines: Arc<HashMap<String, Value>>,
+    workflows: Arc<HashMap<String, Value>>,
     client_id: String,
 ) -> Result<Bytes, ProxyError> {
-    // just in case empty body check
+    // Early exit for empty requests
     if body.is_empty() {
         return Ok(body);
     }
 
-    // Read all the body as a json, it should be a json
-    let mut json: Value = serde_json::from_slice(&body)
+    // Parse incoming OpenAI format request as JSON
+    let json: Value = serde_json::from_slice(&body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
 
-    let mut pipeline_use = serde_json::json!({
+    // Initialize ComfyUI request structure with placeholder values
+    let mut workflow_use = serde_json::json!({
             "prompt": "",
             "client_id": ""
         });
 
-    // if we can get a json hashmap, go ahead
+    // Process the OpenAI request
     if let Some(openai_request) = json.as_object() {
-
-        
-
+        // Extract and validate the model/workflow name
         if let Some(model_name) = openai_request.get("model").and_then(|v| v.as_str()) {
-            if let Some(pipeline) = pipelines.get(model_name) {
-                debug!("📦 Retrieved pipeline '{}'", model_name);
-                pipeline_use["prompt"] = pipeline.clone();
+            if let Some(workflow) = workflows.get(model_name) {
+                debug!("📦 Retrieved workflow '{}'", model_name);
+                // Use the selected workflow as the base prompt
+                workflow_use["prompt"] = workflow.clone();
             } else {
-                return Err(ProxyError::Json(format!("Pipeline '{}' not found", model_name)));
+                return Err(ProxyError::Json(format!("Workflow '{}' not found", model_name)));
             }
         } else {
             return Err(ProxyError::Json(format!("Failed to get model name from JSON")));
         }
 
-
-        
-        if let Some(obj) = pipeline_use.as_object_mut() {
-            // Modify client id
+        // Modify the prompt with request-specific parameters
+        if let Some(obj) = workflow_use.as_object_mut() {
+            // Set the client ID for WebSocket tracking
             obj.insert(
                 "client_id".to_string(),
                 Value::String(client_id.clone()),
             );
 
-            // modify prompt
-            if let Some(pipeline_prompt) = pipeline_use.get_mut("prompt").and_then(|v| v.as_object_mut()){
-
-                for (_node_id, node_data) in pipeline_prompt {
+            // Modify workflow nodes to inject parameters from OpenAI request
+            if let Some(workflow_prompt) = workflow_use.get_mut("prompt").and_then(|v| v.as_object_mut()){
+                for (_node_id, node_data) in workflow_prompt {
                     if let Some(class_type) = node_data["class_type"].as_str() {
                         match class_type {
+                            // Handle image generation size and batch size
                             "EmptyLatentImage" | "EmptySD3LatentImage" => {
-                                // Look to modify size and copies
                                 if let Some(inputs_data_size) = node_data["inputs"].as_object_mut() {
-
-                                    // Size
+                                    // Parse and set image dimensions
                                     if let Some(size_data) = openai_request.get("size").and_then(|v| v.as_str()) {
                                         debug!("✏️ Requested image size: {}", size_data);
-                                        // Split and parse
+                                        // Parse "1024x1024" format to width and height
                                         let size_data_split: Vec<i32> = size_data.split('x')
-                                            .map(|p| p.parse().unwrap())
+                                            .map(|p| p.parse().unwrap_or(512))
                                             .collect();
 
                                         inputs_data_size.insert(
                                             "width".to_string(),
-                                            Value::String(size_data_split[0].to_string()),
+                                            Value::String(size_data_split.get(0).unwrap_or(&512).to_string()),
                                         );
                                         inputs_data_size.insert(
                                             "height".to_string(),
-                                            Value::String(size_data_split[1].to_string()),
+                                            Value::String(size_data_split.get(1).unwrap_or(&512).to_string()),
                                         );
                                     } else {
                                         return Err(ProxyError::Json(format!("Failed to get size from JSON")));
                                     }
 
-                                    // Copies
+                                    // Set batch size (number of images to generate)
                                     if let Some(copies_num_data) = openai_request.get("n").and_then(|v| v.as_i64()) {
                                         debug!("✏️ Requested copies: {}", copies_num_data);
                                         inputs_data_size.insert(
                                             "batch_size".to_string(),
                                             Value::String(copies_num_data.to_string()),
                                         );
-
                                     } else {
-                                        debug!("No \"c\" (copies) in JSON, default to 1");
+                                        debug!("No 'n' (copies) in JSON, using workflow default");
                                     }
-
-
                                 }   
                             }
+                            // Handle text prompts for image generation
                             "CLIPTextEncode" => {
-                                // Look to modify prompts
+                                // Check if this is a positive or negative prompt node
                                 if let Some(meta_data) = node_data["_meta"].as_object() {
                                     if let Some(title) = meta_data["title"].as_str() {
+                                        // Inject positive prompt
                                         if title == "Positive Prompt" { 
-                                            // Modify here
                                             if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
-
                                                 if let Some(prompt_input) = openai_request.get("prompt").and_then(|v| v.as_str()) {
                                                     debug!("✏️ Requested prompt: {}", prompt_input);
                                                     inputs_data.insert(
@@ -374,10 +414,10 @@ async fn create_json_payload(
                                                     return Err(ProxyError::Json(format!("Failed to get prompt from JSON")));
                                                 }
                                             }
-                                        } else if title == "Negative Prompt" {
-                                            // Modify here (if needed)
+                                        }
+                                        // Inject negative prompt (optional)
+                                        else if title == "Negative Prompt" {
                                             if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
-
                                                 if let Some(neg_prompt_input) = openai_request.get("negative_prompt").and_then(|v| v.as_str()) {
                                                     debug!("✏️ Requested negative prompt: {}", neg_prompt_input);
                                                     inputs_data.insert(
@@ -385,44 +425,45 @@ async fn create_json_payload(
                                                         Value::String(neg_prompt_input.to_string()),
                                                     );
                                                 } else {
-                                                    debug!("No negative_prompt in JSON");
+                                                    debug!("No negative_prompt in JSON, using workflow default");
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
+                            // Skip other node types
                             _ => {
                                 continue
                             }
                         }
-                            
-
                     }
                 }
             }
-
         }
 
-        
-        
-
         debug!("🔧 Generated JSON payload");
-
     }
 
-    let modified_json = serde_json::to_vec(&pipeline_use)
+    // Serialize the modified ComfyUI prompt to JSON bytes
+    let modified_json = serde_json::to_vec(&workflow_use)
         .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
 
     Ok(Bytes::from(modified_json))
 }
 
-/// Regular response handler, will receive the response and then send it back to
-/// the proxied source
+/// Handles the response from ComfyUI backend
+///
+/// This function:
+/// 1. Extracts the prompt_id from the backend response
+/// 2. Waits for job completion via WebSocket
+/// 3. Retrieves generated images from the backend
+/// 4. Encodes images as base64
+/// 5. Returns response in OpenAI API format
 async fn handle_regular_response(
     upstream_response: reqwest::Response,
     target_base: String, 
-    headers: HeaderMap,
+    _headers: HeaderMap,
     client: &Client,
     ws_manager: &Arc<WebSocketManager>,
 ) -> Result<AxumResponse, ProxyError> {
@@ -431,6 +472,7 @@ async fn handle_regular_response(
 
     debug!("📄 Handling regular response with status: {}", status);
 
+    // Read response body from backend
     let body_bytes = upstream_response
         .bytes()
         .await
@@ -438,7 +480,7 @@ async fn handle_regular_response(
 
     debug!("📥 Response body: {} bytes", body_bytes.len());
 
-    // Read all the body as a json, it should be a json
+    // Parse backend response as JSON
     let json: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
 
@@ -447,7 +489,7 @@ async fn handle_regular_response(
             json.to_string()
         );
 
-    // Check for prompt_id in the response
+    // Extract the prompt_id which identifies this job in ComfyUI
     let prompt_id = json.get("prompt_id").and_then(|v| v.as_str());
     if let Some(pid) = prompt_id {
         debug!(
@@ -455,14 +497,14 @@ async fn handle_regular_response(
             pid
         );
 
-        // Wait for the job to complete via WebSocket
+        // Block until the job completes via WebSocket
         if let Err(e) = ws_manager.wait_for_job_completion(pid).await {
             warn!("⚠️ Failed to wait for job completion: {}", e);
-            // Continue anyway, don't fail the response
+            // Continue anyway - the job might still complete
         }
     }
 
-    // Call history to retrieve image location
+    // Fetch generated images from ComfyUI backend and prepare response
     let image_response_json = retrieve_image_from_history(
         target_base,
         prompt_id,
@@ -473,6 +515,7 @@ async fn handle_regular_response(
 
 
 
+    // Serialize the image response JSON to bytes
     let output_json = serde_json::to_vec(&image_response_json)
         .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
     let output_body_bytes = Bytes::from(output_json);
@@ -481,7 +524,7 @@ async fn handle_regular_response(
         output_body_bytes.len()
     );
 
-    // Copy headers
+    // Copy and update response headers
     let mut response_headers = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers.iter() {
         if let (Ok(name), Ok(value)) = (
@@ -489,7 +532,7 @@ async fn handle_regular_response(
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
             if name.as_str() == "content-length" {
-                // Replace context len with valid value
+                // Update content-length to match the final response size
                 if let Ok(value) =
                     HeaderValue::from_str(format!("{}", output_body_bytes.len()).as_str())
                 {
@@ -501,6 +544,7 @@ async fn handle_regular_response(
         }
     }
 
+    // Build the final HTTP response
     let mut response = AxumResponse::builder().status(status.as_u16());
 
     for (name, value) in response_headers.iter() {
@@ -514,7 +558,24 @@ async fn handle_regular_response(
         .map_err(|e| ProxyError::Internal(format!("Failed to build regular response: {}", e)))
 }
 
-
+/// Retrieves generated images from ComfyUI backend
+///
+/// This function:
+/// 1. Queries the ComfyUI history endpoint for the given prompt_id
+/// 2. Extracts image metadata from the job outputs
+/// 3. Downloads each image from the view endpoint
+/// 4. Base64 encodes the images
+/// 5. Formats the response in OpenAI API standards
+///
+/// # Arguments
+/// * `target_base` - ComfyUI backend address (host:port)
+/// * `prompt_id` - The job ID to retrieve results for
+/// * `headers` - Original request headers (may contain auth)
+/// * `client` - HTTP client for backend communication
+///
+/// # Returns
+/// - JSON response in OpenAI image generation format with base64 encoded images
+/// - ProxyError if history lookup or image retrieval fails
 async fn retrieve_image_from_history(
     target_base: String,
     prompt_id: Option<&str>,
@@ -522,7 +583,7 @@ async fn retrieve_image_from_history(
     client: &Client,
 ) -> Result<Value, ProxyError> {
 
-    // Handle case where prompt_id is None
+    // Validate that we have a prompt_id
     let prompt_id = match prompt_id {
         Some(id) => id,
         None => {
@@ -533,42 +594,38 @@ async fn retrieve_image_from_history(
         }
     };
 
-    // Append the target path
+    // Construct URL to ComfyUI history endpoint
     let history_url: String = format!("http://{}/history/{}", target_base, prompt_id);
 
     debug!("🔍 Checking history at {} for {}", target_base, prompt_id);
 
+    // Prepare headers for backend requests
     let mut upstream_headers = reqwest::header::HeaderMap::new();
 
-    // Add authorization header if present in original request
+    // Forward authorization headers if present
     if let Some(auth) = headers.get("authorization") {
         if let Ok(auth_value) = reqwest::header::HeaderValue::from_bytes(auth.as_bytes()) {
             upstream_headers.insert(reqwest::header::AUTHORIZATION, auth_value);
         }
     }
 
-    // Debug: Print all headers being sent
+    // Log headers for debugging
     debug!("📋 Headers to send (if any):");
     for (name, value) in upstream_headers.iter() {
         debug!("   {}: {}", name, value.to_str().unwrap_or("[unprintable]"));
     }
     
-    // Build request
-    let request_builder = 
-        // set client
-        client
-        // add method and endpoint
+    // Build request to history endpoint
+    let request_builder = client
         .request(Method::GET, &history_url)
-        // add headers
         .headers(upstream_headers.clone());
 
     debug!("⏳ Sending history request to backend...");
     
-    // Add a timeout wrapper to catch hanging requests
+    // Query history with timeout protection
     let request_future = request_builder.send();
     let timeout_duration = Duration::from_secs(5);
 
-    // Await the request future
     let upstream_response = match tokio::time::timeout(timeout_duration, request_future).await {
         Ok(Ok(response)) => {
             debug!(
@@ -586,27 +643,27 @@ async fn retrieve_image_from_history(
         }
     };
 
-
-    // Get history data:
+    // Parse history response
     let response_body = upstream_response
         .bytes()
         .await
         .map_err(|e| ProxyError::Upstream(format!("Failed to read history response body: {}", e)))?;
     let history_json: Value = serde_json::from_slice(&response_body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse history JSON: {}", e)))?;
-    // debug!("✅ Retrieved history: {}", history_json.to_string());
 
-
-    // Look for job image name and path
+    // Extract image metadata from job outputs
     let mut image_files: Vec<ImageFile> = Vec::new();
     if let Some(prompt_hist) = history_json.get(prompt_id).and_then(|v| v.as_object()) {
         if let Some(out_nodes) = prompt_hist.get("outputs").and_then(|v| v.as_object())
         {
-            for (node_id, out_node_data) in out_nodes {
+            // Iterate through output nodes looking for generated images
+            for (_node_id, out_node_data) in out_nodes {
                 if let Some(all_images_data) = out_node_data.get("images").and_then(|v| v.as_array())
                 {
+                    // Process each image in the node output
                     for image_data in all_images_data {
                         if let Some(type_field) = image_data["type"].as_str() {
+                            // Only include output images (not temporary/preview)
                             if type_field == "output" {
                                 if let Some(filename) = image_data["filename"].as_str() {
                                     if let Some(subfolder) = image_data["subfolder"].as_str() {
@@ -619,7 +676,6 @@ async fn retrieve_image_from_history(
                                     }
                                 }
                             }
-                            
                         }
                     }
                 }
@@ -634,30 +690,26 @@ async fn retrieve_image_from_history(
 
     debug!("📦 Collected {} image files", image_files.len());
     let mut response_data: Vec<serde_json::Value> = Vec::new();
+    
+    // Download and encode each generated image
     for image_file_data in image_files {
-
+        // Construct query parameters for the view endpoint
         let view_query = serde_urlencoded::to_string(&image_file_data).
             map_err(|e| ProxyError::Json(format!("Failed to serialize image data query: {}", e)))?;
 
         let view_url: String = format!("http://{}/view?{}", target_base, view_query);
 
-
-        // Build request
-        let request_builder = 
-            // set client
-            client
-            // add method and endpoint
+        // Build request to image view endpoint
+        let request_builder = client
             .request(Method::GET, &view_url)
-            // add headers
             .headers(upstream_headers.clone());
 
         debug!("⏳ Sending view request to backend: {}", view_query);
         
-        // Add a timeout wrapper to catch hanging requests
+        // Download image with timeout
         let request_future = request_builder.send();
         let timeout_duration = Duration::from_secs(5);
 
-        // Await the request future
         let view_response = match tokio::time::timeout(timeout_duration, request_future).await {
             Ok(Ok(response)) => {
                 debug!(
@@ -675,7 +727,7 @@ async fn retrieve_image_from_history(
             }
         };
 
-        
+        // Read image bytes and encode as base64
         let image_bytes = view_response.bytes().await?;
         debug!("📋 Read {} image bytes", image_bytes.len());
         let b64_image = general_purpose::STANDARD.encode(image_bytes);
@@ -684,8 +736,7 @@ async fn retrieve_image_from_history(
         }));
     }
 
-
-    // Create response with image files
+    // Create OpenAI API format response with timestamp
     let created = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .map_err(|_| ProxyError::Internal("Failed to get current time".to_string()))?

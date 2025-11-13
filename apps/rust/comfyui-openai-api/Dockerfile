@@ -15,7 +15,7 @@ RUN rm -rf src/*.rs
 COPY apps/rust/comfyui-openai-api/src src
 
 # Build your release binary
-RUN rm ./target/release/deps/comfyui-openai-api*
+RUN rm ./target/release/deps/comfyui_openai_api*
 # Use --locked if you want to ensure the exact dependencies from Cargo.lock are used
 RUN cargo install --path .
 
