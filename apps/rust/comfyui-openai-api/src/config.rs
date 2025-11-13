@@ -13,6 +13,7 @@ pub struct ComfyUiProxyConfig {
     pub host: String,
     pub port: u16,
     pub client_id: String,
+    pub pipelines_folder: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

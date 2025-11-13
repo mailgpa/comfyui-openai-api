@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method},
     response::{Response as AxumResponse},
 };
-use log::{debug, error, warn};
+use log::{debug, error, warn, info};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
@@ -12,6 +12,8 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use crate::ws::WebSocketManager;
 use base64::{engine::general_purpose, Engine as _};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
 struct ImageFile {
@@ -19,6 +21,72 @@ struct ImageFile {
     subfolder: String,
     #[serde(rename = "type")]
     type_field: String,
+}
+
+/// Loads all JSON files from a directory and returns them as a map
+/// where the key is the filename without extension and the value is the parsed JSON
+pub struct PipelinesLoader;
+
+impl PipelinesLoader {
+    /// Load all .json files from the specified folder path
+    /// Returns a HashMap with filename (without extension) -> JSON content
+    pub fn load_from_folder(folder_path: &str) -> Result<HashMap<String, Value>, String> {
+        let path = Path::new(folder_path);
+        
+        // Check if the folder exists
+        if !path.exists() {
+            return Err(format!("Pipelines folder does not exist: {}", folder_path));
+        }
+        
+        if !path.is_dir() {
+            return Err(format!("Pipelines path is not a directory: {}", folder_path));
+        }
+        
+        let mut pipelines = HashMap::new();
+        
+        // Read all entries in the directory
+        let entries = fs::read_dir(path)
+            .map_err(|e| format!("Failed to read pipelines directory: {}", e))?;
+        
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| format!("Failed to read directory entry: {}", e))?;
+            let file_path = entry.path();
+            
+            // Only process JSON files
+            if file_path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("json"))
+                .unwrap_or(false)
+            {
+                // Get the filename without extension
+                let filename = file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| {
+                        format!("Failed to get filename for: {:?}", file_path)
+                    })?
+                    .to_string();
+                
+                // Read and parse the JSON file
+                let file_content = fs::read_to_string(&file_path)
+                    .map_err(|e| {
+                        format!("Failed to read JSON file {}: {}", file_path.display(), e)
+                    })?;
+                
+                let json_value: Value = serde_json::from_str(&file_content)
+                    .map_err(|e| {
+                        format!("Failed to parse JSON from {}: {}", file_path.display(), e)
+                    })?;
+                
+                info!("✅ Loaded pipeline: {}", filename);
+                pipelines.insert(filename, json_value);
+            }
+        }
+        
+        info!("📦 Successfully loaded {} pipeline(s)", pipelines.len());
+        Ok(pipelines)
+    }
 }
 
 use crate::proxy::{ProxyState, ProxyError, handle_request_error, handle_timeout_error};
@@ -79,6 +147,7 @@ pub async fn generations_response(
         debug!("🔧 Generating comfyui request body...");
         match create_json_payload(
             body_bytes,
+            state.pipelines.clone(),
             state.backend_client_id.clone(),
         )
         .await
@@ -200,6 +269,7 @@ pub async fn generations_response(
 /// Modifies the json payload of a openAI image request to adapt it to ComfyUI
 async fn create_json_payload(
     body: Bytes,
+    pipelines: Arc<HashMap<String, Value>>,
     client_id: String,
 ) -> Result<Bytes, ProxyError> {
     // just in case empty body check
@@ -211,30 +281,137 @@ async fn create_json_payload(
     let mut json: Value = serde_json::from_slice(&body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
 
-    // // if we can get a json hashmap, go ahead
-    // if let Some(openai_request) = json.as_object() {
+    let mut pipeline_use = serde_json::json!({
+            "prompt": "",
+            "client_id": ""
+        });
 
-    //     if let Some(model_name) = openai_request.get("model").and_then(|v| v.as_string()) {
-    //         // 
+    // if we can get a json hashmap, go ahead
+    if let Some(openai_request) = json.as_object() {
 
-    //     } else {
-    //         Err(ProxyError::Json(format!("Failed to get model name from JSON")))
-    //     }
+        
+
+        if let Some(model_name) = openai_request.get("model").and_then(|v| v.as_str()) {
+            if let Some(pipeline) = pipelines.get(model_name) {
+                debug!("📦 Retrieved pipeline '{}'", model_name);
+                pipeline_use["prompt"] = pipeline.clone();
+            } else {
+                return Err(ProxyError::Json(format!("Pipeline '{}' not found", model_name)));
+            }
+        } else {
+            return Err(ProxyError::Json(format!("Failed to get model name from JSON")));
+        }
 
 
+        
+        if let Some(obj) = pipeline_use.as_object_mut() {
+            // Modify client id
+            obj.insert(
+                "client_id".to_string(),
+                Value::String(client_id.clone()),
+            );
 
-    //     if obj.contains_key("client_id") {
-    //         obj.insert(
-    //             "client_id".to_string(),
-    //             Value::String(client_id.clone()),
-    //         );
-    //     }
+            // modify prompt
+            if let Some(pipeline_prompt) = pipeline_use.get_mut("prompt").and_then(|v| v.as_object_mut()){
 
-    //     debug!("🔧 Modified JSON payload");
+                for (_node_id, node_data) in pipeline_prompt {
+                    if let Some(class_type) = node_data["class_type"].as_str() {
+                        match class_type {
+                            "EmptyLatentImage" | "EmptySD3LatentImage" => {
+                                // Look to modify size and copies
+                                if let Some(inputs_data_size) = node_data["inputs"].as_object_mut() {
 
-    // }
+                                    // Size
+                                    if let Some(size_data) = openai_request.get("size").and_then(|v| v.as_str()) {
+                                        debug!("✏️ Requested image size: {}", size_data);
+                                        // Split and parse
+                                        let size_data_split: Vec<i32> = size_data.split('x')
+                                            .map(|p| p.parse().unwrap())
+                                            .collect();
 
-    let modified_json = serde_json::to_vec(&json)
+                                        inputs_data_size.insert(
+                                            "width".to_string(),
+                                            Value::String(size_data_split[0].to_string()),
+                                        );
+                                        inputs_data_size.insert(
+                                            "height".to_string(),
+                                            Value::String(size_data_split[1].to_string()),
+                                        );
+                                    } else {
+                                        return Err(ProxyError::Json(format!("Failed to get size from JSON")));
+                                    }
+
+                                    // Copies
+                                    if let Some(copies_num_data) = openai_request.get("n").and_then(|v| v.as_i64()) {
+                                        debug!("✏️ Requested copies: {}", copies_num_data);
+                                        inputs_data_size.insert(
+                                            "batch_size".to_string(),
+                                            Value::String(copies_num_data.to_string()),
+                                        );
+
+                                    } else {
+                                        debug!("No \"c\" (copies) in JSON, default to 1");
+                                    }
+
+
+                                }   
+                            }
+                            "CLIPTextEncode" => {
+                                // Look to modify prompts
+                                if let Some(meta_data) = node_data["_meta"].as_object() {
+                                    if let Some(title) = meta_data["title"].as_str() {
+                                        if title == "Positive Prompt" { 
+                                            // Modify here
+                                            if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
+
+                                                if let Some(prompt_input) = openai_request.get("prompt").and_then(|v| v.as_str()) {
+                                                    debug!("✏️ Requested prompt: {}", prompt_input);
+                                                    inputs_data.insert(
+                                                        "text".to_string(),
+                                                        Value::String(prompt_input.to_string()),
+                                                    );
+                                                } else {
+                                                    return Err(ProxyError::Json(format!("Failed to get prompt from JSON")));
+                                                }
+                                            }
+                                        } else if title == "Negative Prompt" {
+                                            // Modify here (if needed)
+                                            if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
+
+                                                if let Some(neg_prompt_input) = openai_request.get("negative_prompt").and_then(|v| v.as_str()) {
+                                                    debug!("✏️ Requested negative prompt: {}", neg_prompt_input);
+                                                    inputs_data.insert(
+                                                        "text".to_string(),
+                                                        Value::String(neg_prompt_input.to_string()),
+                                                    );
+                                                } else {
+                                                    debug!("No negative_prompt in JSON");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                continue
+                            }
+                        }
+                            
+
+                    }
+                }
+            }
+
+        }
+
+        
+        
+
+        debug!("🔧 Generated JSON payload");
+
+    }
+
+    let modified_json = serde_json::to_vec(&pipeline_use)
         .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
 
     Ok(Bytes::from(modified_json))
@@ -417,7 +594,7 @@ async fn retrieve_image_from_history(
         .map_err(|e| ProxyError::Upstream(format!("Failed to read history response body: {}", e)))?;
     let history_json: Value = serde_json::from_slice(&response_body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse history JSON: {}", e)))?;
-    debug!("✅ Retrieved history: {}", history_json.to_string());
+    // debug!("✅ Retrieved history: {}", history_json.to_string());
 
 
     // Look for job image name and path
@@ -426,7 +603,6 @@ async fn retrieve_image_from_history(
         if let Some(out_nodes) = prompt_hist.get("outputs").and_then(|v| v.as_object())
         {
             for (node_id, out_node_data) in out_nodes {
-                debug!("📨 {}: ", node_id);
                 if let Some(all_images_data) = out_node_data.get("images").and_then(|v| v.as_array())
                 {
                     for image_data in all_images_data {
@@ -434,7 +610,7 @@ async fn retrieve_image_from_history(
                             if type_field == "output" {
                                 if let Some(filename) = image_data["filename"].as_str() {
                                     if let Some(subfolder) = image_data["subfolder"].as_str() {
-                                        debug!("Found: filename: {}, subfolder: {}", filename, subfolder);
+                                        debug!("🔍 Found: filename: {}, subfolder: {}", filename, subfolder);
                                         image_files.push(ImageFile {
                                             filename: filename.to_string(),
                                             subfolder: subfolder.to_string(),

@@ -13,6 +13,7 @@ use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 use config::Config;
 use proxy::ProxyState;
 use ws::WebSocketManager;
+use comfyui::PipelinesLoader;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
@@ -43,6 +44,8 @@ async fn main() {
     info!("🔗 ComfyUI Backend Configuration:");
     info!("   Host: {}", config.comfyui_backend.host);
     info!("   Port: {}", config.comfyui_backend.port);
+    info!("   ClientID: {}", config.comfyui_backend.client_id);
+    info!("   Pipelines Path: {}", config.comfyui_backend.pipelines_folder);
     info!("");
     info!("⏱️  Routing Configuration:");
     info!("   Timeout (seconds): {}", config.routing.timeout_seconds);
@@ -62,6 +65,7 @@ async fn main() {
         config.comfyui_backend.client_id,
         config.routing.timeout_seconds.into(),
         config.routing.max_payload_size_mb.into(),
+        config.comfyui_backend.pipelines_folder.into(),
     )
     .await;
 }
@@ -74,6 +78,7 @@ async fn run_server(
     backend_client_id: String,
     tcp_timeout: u64,
     max_payload_size_mb: usize,
+    pipelines_config: String,
 ) {
     // Simple HTTP1 client
     let client = Client::builder()
@@ -110,6 +115,18 @@ async fn run_server(
         }
     };
 
+    // Load pipelines from config
+    let pipelines = match PipelinesLoader::load_from_folder(&pipelines_config.to_string()) {
+                Ok(pipelines_map) => {
+                    info!("✅ Pipelines loaded successfully");
+                    Arc::new(pipelines_map)
+                }
+                Err(e) => {
+                    eprintln!("Failed to load pipelines: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
     // Wrap the HTTP client and other needed data in an
     // Arc (atomic reference counter) so it can be safely shared across
     // multiple async tasks
@@ -121,6 +138,7 @@ async fn run_server(
         max_payload_size_mb: max_payload_size_mb,
         timeout: tcp_timeout + 10, // 10 more seconds
         ws_manager,
+        pipelines,
     });
 
 

@@ -91,7 +91,7 @@ impl WebSocketManager {
             match read.next().await {
                 Some(Ok(msg)) => {
                     if let Message::Text(text) = msg {
-                        debug!("📨 WebSocket message received: {}", text);
+                        // debug!("📨 WebSocket message received: {}", text);
 
                         // Parse the message
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
@@ -112,10 +112,10 @@ impl WebSocketManager {
                                                     // Add to completed jobs buffer
                                                     let mut jobs = manager.completed_jobs.lock().await;
                                                     jobs.add(prompt_id.to_string());
-                                                } else if let Some(node_str) = node.as_str() {
+                                                } else if let Some(node_num) = node.as_str() {
                                                     debug!(
                                                         "🔄 Job {} executing node: {}",
-                                                        prompt_id, node_str
+                                                        prompt_id, node_num
                                                     );
                                                 }
                                             }

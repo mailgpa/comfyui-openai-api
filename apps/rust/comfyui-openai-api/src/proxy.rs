@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::ws::WebSocketManager;
 use crate::comfyui::{generations_response};
+use serde_json::Value;
 
 
 
@@ -25,6 +26,7 @@ pub struct ProxyState {
     pub max_payload_size_mb: usize,
     pub timeout: u64,
     pub ws_manager: Arc<WebSocketManager>,
+    pub pipelines: Arc<HashMap<String, Value>>,
 }
 
 #[derive(Debug)]

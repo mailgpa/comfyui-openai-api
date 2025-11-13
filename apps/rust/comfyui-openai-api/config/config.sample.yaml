@@ -9,10 +9,12 @@ server:
   port: 8080
 
 # The configuration of you ComfyUI backend to cover
-vllm_backend:
+comfyui_backend:
   # Where the ComfyUI is deployed
   host: "http://127.0.0.1"
   port: 8000
+    # Path to folder containing .json pipeline files
+  pipelines_folder: "./pipelines"
   
 
 # This configures the request routing
@@ -21,3 +23,4 @@ routing:
   timeout_seconds: 600
   # Max payload to accept/transmit
   max_payload_size_mb: 10
+
