@@ -37,8 +37,8 @@ pub struct ProxyState {
     pub max_payload_size_mb: usize,
     /// Request timeout in seconds
     pub timeout: u64,
-    /// WebSocket manager for job completion tracking
-    pub ws_manager: Arc<WebSocketManager>,
+    /// WebSocket manager for job completion tracking (optional if use_ws is false)
+    pub ws_manager: Option<Arc<WebSocketManager>>,
     /// Whether to use or not WebSockets
     pub use_ws: bool,
     /// Pre-loaded workflows (workflows) keyed by model name

@@ -494,7 +494,7 @@ async fn handle_regular_response(
     _headers: HeaderMap,
     use_ws: bool,
     client: &Client,
-    ws_manager: &Arc<WebSocketManager>,
+    ws_manager: &Option<Arc<WebSocketManager>>,
 ) -> Result<AxumResponse, ProxyError> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
@@ -528,10 +528,14 @@ async fn handle_regular_response(
 
         // // Block until the job completes via WebSocket
         if use_ws {
-            match timeout(Duration::from_secs(600), ws_manager.wait_for_job_completion(pid)).await {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => warn!("⚠️ Failed to wait for job completion: {}", e),
-                Err(_) => warn!("⚠️ Job completion wait timed out after 600 seconds"),
+            if let Some(manager) = ws_manager {
+                match timeout(Duration::from_secs(600), manager.wait_for_job_completion(pid)).await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => warn!("⚠️ Failed to wait for job completion: {}", e),
+                    Err(_) => warn!("⚠️ Job completion wait timed out after 600 seconds"),
+                }
+            } else {
+                warn!("⚠️ WebSocket manager is not initialized but use_ws is true");
             }
         } else {
             loop {
@@ -801,7 +805,22 @@ async fn retrieve_image_from_history(
 
 
 
-
+/// Checks a job state from ComfyUI backend
+///
+/// This function:
+/// 1. Queries the ComfyUI queue endpoint for the given prompt_id
+/// 2. Looks for the given job ID in both queues (pending y running)
+/// 3. Returns true if not found
+///
+/// # Arguments
+/// * `target_base` - ComfyUI backend address (host:port)
+/// * `prompt_id` - The job ID to retrieve results for
+/// * `headers` - Original request headers (may contain auth)
+/// * `client` - HTTP client for backend communication
+///
+/// # Returns
+/// - True if the given job id is not in the queues and hence finished
+/// - ProxyError if history lookup or image retrieval fails
 async fn check_queue(
     target_base: String,
     prompt_id: Option<&str>,

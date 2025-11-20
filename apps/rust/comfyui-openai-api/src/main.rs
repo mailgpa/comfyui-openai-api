@@ -131,22 +131,27 @@ async fn run_server(
 
     // Initialize WebSocket manager for persistent connection to ComfyUI backend
     // This manages the ws://backend:port/ws?clientId=X connection for job completion tracking
-    // TODO : Make tis conditional to `use_ws`
-    let ws_manager = match WebSocketManager::new(
-        backend_addr.clone(),
-        backend_port.clone(),
-        backend_client_id.clone(),
-    )
-    .await
-    {
-        Ok(manager) => {
-            info!("✅ WebSocket manager initialized successfully");
-            manager
+    // Only initialize if use_ws is enabled in the configuration
+    let ws_manager: Option<Arc<WebSocketManager>> = if use_ws {
+        match WebSocketManager::new(
+            backend_addr.clone(),
+            backend_port.clone(),
+            backend_client_id.clone(),
+        )
+        .await
+        {
+            Ok(manager) => {
+                info!("✅ WebSocket manager initialized successfully");
+                Some(manager)
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize WebSocket manager: {}", e);
+                std::process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("Failed to initialize WebSocket manager: {}", e);
-            std::process::exit(1);
-        }
+    } else {
+        info!("⏭️  WebSocket support disabled in configuration");
+        None
     };
 
     // Load all workflow JSON files from the specified directory
