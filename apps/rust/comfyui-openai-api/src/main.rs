@@ -17,7 +17,7 @@ mod proxy;
 mod comfyui;
 mod ws;
 
-use axum::{routing::any, Router};
+use axum::{routing::any, routing::get, Router};
 use log::info;
 use reqwest::Client;
 use std::{sync::Arc, time::Duration};
@@ -187,6 +187,8 @@ async fn run_server(
         // Route all HTTP methods to /v1/images/* path to match OpenAI API standard
         // This captures paths like /v1/images/generations
         .route("/v1/images/*path", any(proxy::proxy_handler))
+        // Health check endpoint used by Docker E2E and readiness probes
+        .route("/health", get(proxy::health_handler))
         // Enable CORS to allow requests from any origin
         .layer(CorsLayer::permissive())
         // Set request body size limit to prevent memory exhaustion

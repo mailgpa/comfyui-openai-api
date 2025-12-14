@@ -1,0 +1,13 @@
+log_level: info
+server:
+  host: "0.0.0.0"
+  port: 8080
+comfyui_backend:
+  host: "127.0.0.1"
+  port: 8188
+  client_id: "openai-proxy-client"
+  workflows_folder: "/app/workflows"
+  use_ws: true
+routing:
+  timeout_seconds: 120
+  max_payload_size_mb: 20
