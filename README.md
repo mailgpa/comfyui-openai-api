@@ -9,6 +9,7 @@ A high-performance reverse proxy that translates OpenAI image generation API cal
 This proxy serves as a bridge between OpenAI API-compatible clients and ComfyUI. It:
 
 - **Accepts** standard OpenAI image generation requests (`POST /v1/images/generations`)
+- **Supports** OpenAI-compatible img2img requests (`POST /v1/images/edits` with a base64 `image` field)
 - **Translates** OpenAI parameters to ComfyUI workflow format
 - **Manages** job execution via persistent WebSocket connection
 - **Retrieves** generated images from ComfyUI backend
@@ -106,23 +107,34 @@ cargo build --release
 
 #### Docker
 
-```bash
-# Build image
-docker build -t comfyui-openai-api .
+Build an all-in-one image that runs both ComfyUI and the OpenAI-compatible proxy:
 
-# Run container
-docker run -p 8080:8080 \
-  -v $(pwd)/config:/app/config \
+```bash
+docker build -t comfyui-openai-api .
+```
+
+Run the container, exposing the proxy (8080) and ComfyUI (8188) ports. You can mount your own workflows to replace the defaults bundled in the image:
+
+```bash
+docker run \
+  -p 8080:8080 \
+  -p 8188:8188 \
   -v $(pwd)/workflows:/app/workflows \
   comfyui-openai-api
 ```
 
-#### Docker Compose
+The image uses `/app/config/config.yaml` by default; override it by setting `CONFIG_PATH` or mounting your own config file at that path.
 
-(coming soon, currently it only launches a ComfyUI backend for testing)
+To verify the image end-to-end (build, start ComfyUI, and check the proxy responds), run the helper script:
 
 ```bash
-docker-compose up --build
+./scripts/docker-e2e.sh
+```
+
+The script builds the image, starts a temporary container, waits for ComfyUI on port 8188, and probes the proxy on port 8080 before cleaning everything up. If Docker isn't installed, the script will safely skip without failing your session. You can also manually check readiness by curling the proxy health endpoint:
+
+```bash
+curl http://localhost:8080/health
 ```
 
 ## Configuration
@@ -237,6 +249,13 @@ response = client.images.generate(
 
 print(response.data[0].b64_json)
 ```
+
+### Image-to-Image (img2img)
+
+Send `POST /v1/images/edits` with the same JSON fields as `generations` plus an
+`image` key containing a base64-encoded source image (data URLs are supported).
+Workflows that include a **LoadImage** node will receive the uploaded file
+automatically.
 
 ## Workflow Management
 

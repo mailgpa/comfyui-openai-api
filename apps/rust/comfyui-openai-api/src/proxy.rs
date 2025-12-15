@@ -3,19 +3,20 @@
 //! This module implements the core proxy functionality, routing incoming OpenAI API
 //! requests to ComfyUI backend and handling error responses.
 
+use crate::comfyui::{generations_response, img2img_response};
+use crate::ws::WebSocketManager;
 use axum::{
-    body::{Body},
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response as AxumResponse},
+    Json,
 };
-use log::{error};
+use log::{error, warn};
 use reqwest::Client;
 use serde::Serialize;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use crate::ws::WebSocketManager;
-use crate::comfyui::{generations_response};
 use serde_json::Value;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 /// Shared state passed to all request handlers
 ///
@@ -73,6 +74,19 @@ struct ErrorResponse {
     message: String,
 }
 
+/// Response payload for the health endpoint
+#[derive(Serialize)]
+pub struct HealthResponse {
+    /// Overall service status
+    status: &'static str,
+    /// Status of the ComfyUI backend probe
+    backend_status: &'static str,
+    /// Number of available workflows
+    workflows: usize,
+    /// Whether WebSocket support is enabled
+    use_ws: bool,
+}
+
 /// Converts ProxyError into an HTTP response with appropriate status code and JSON body
 impl IntoResponse for ProxyError {
     fn into_response(self) -> AxumResponse {
@@ -97,7 +111,6 @@ impl IntoResponse for ProxyError {
                 error!("❌ Implementation error: {}", msg);
                 (StatusCode::BAD_REQUEST, "IMPLEMENTATION_ERROR", msg)
             }
-
         };
 
         let error_response = ErrorResponse {
@@ -134,25 +147,16 @@ pub fn handle_request_error(e: reqwest::Error, full_url: &str) -> ProxyError {
     error!("❌ Is request: {}", e.is_request());
     error!("❌ Is decode: {}", e.is_decode());
     if e.is_timeout() {
-        ProxyError::Upstream(format!(
-            "Request timeout to {}: {}",
-            full_url, e
-        ))
+        ProxyError::Upstream(format!("Request timeout to {}: {}", full_url, e))
     } else if e.is_connect() {
         ProxyError::Upstream(format!(
             "Connection failed to {}: {} - Check if backend server is running",
             full_url, e
         ))
     } else if e.is_request() {
-        ProxyError::Upstream(format!(
-            "Request error to {}: {}",
-            full_url, e
-        ))
+        ProxyError::Upstream(format!("Request error to {}: {}", full_url, e))
     } else {
-        ProxyError::Upstream(format!(
-            "Network error to {}: {}",
-            full_url, e
-        ))
+        ProxyError::Upstream(format!("Network error to {}: {}", full_url, e))
     }
 }
 
@@ -193,12 +197,14 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Result<AxumResponse, ProxyError> {
-
     // Route based on the requested endpoint
-    match path.as_str()  {
+    match path.as_str() {
         // Handle OpenAI image generation API equivalent
         "generations" => {
             return generations_response(State(state), Query(params), headers, body).await;
+        }
+        "edits" => {
+            return img2img_response(State(state), Query(params), headers, body).await;
         }
         // Reject unsupported endpoints
         _ => {
@@ -209,4 +215,39 @@ pub async fn proxy_handler(
             )));
         }
     }
+}
+
+/// Lightweight health check endpoint
+///
+/// Returns 200 when the proxy is up and the ComfyUI backend responds successfully.
+/// Returns 503 when the backend probe fails or returns a non-success status code.
+pub async fn health_handler(State(state): State<Arc<ProxyState>>) -> AxumResponse {
+    let backend_url = format!("http://{}:{}/", state.backend_url, state.backend_port);
+
+    let (backend_status, status_code) = match state
+        .client
+        .get(&backend_url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => ("ok", StatusCode::OK),
+        Ok(resp) => {
+            warn!("ComfyUI probe returned status {}", resp.status());
+            ("unhealthy", StatusCode::SERVICE_UNAVAILABLE)
+        }
+        Err(err) => {
+            warn!("ComfyUI probe failed: {}", err);
+            ("unreachable", StatusCode::SERVICE_UNAVAILABLE)
+        }
+    };
+
+    let body = HealthResponse {
+        status: if status_code == StatusCode::OK { "ok" } else { "degraded" },
+        backend_status,
+        workflows: state.workflows.len(),
+        use_ws: state.use_ws,
+    };
+
+    (status_code, Json(body)).into_response()
 }

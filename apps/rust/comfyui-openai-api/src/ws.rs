@@ -7,9 +7,7 @@
 //! The connection includes automatic reconnection with exponential backoff to handle
 //! temporary network issues or hung connections.
 
-use axum::http::HeaderMap;
 use log::{debug, error, warn};
-use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
