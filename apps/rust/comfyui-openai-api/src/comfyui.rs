@@ -161,6 +161,14 @@ fn convert_v04_graph_to_prompt(workflow: &Value) -> Result<Value, String> {
     // Build lookup so we can resolve link IDs to (node_id, output_name)
     let mut links: HashMap<i64, (String, String)> = HashMap::new();
     for node in nodes {
+        let Some(class_type) = node.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        if should_ignore_node(class_type) {
+            continue;
+        }
+
         if let Some(node_id) = node.get("id").and_then(|v| v.as_i64()) {
             if let Some(outputs) = node.get("outputs").and_then(|v| v.as_array()) {
                 for output in outputs {
@@ -197,6 +205,10 @@ fn convert_v04_graph_to_prompt(workflow: &Value) -> Result<Value, String> {
             .ok_or_else(|| "Node missing type".to_string())?
             .to_string();
 
+        if should_ignore_node(&class_type) {
+            continue;
+        }
+
         let mut inputs: Map<String, Value> = Map::new();
 
         if let Some(input_list) = node.get("inputs").and_then(|v| v.as_array()) {
@@ -231,6 +243,10 @@ fn convert_v04_graph_to_prompt(workflow: &Value) -> Result<Value, String> {
     }
 
     Ok(Value::Object(prompt))
+}
+
+fn should_ignore_node(class_type: &str) -> bool {
+    matches!(class_type, "MarkdownNote" | "Note")
 }
 
 fn apply_widget_values(class_type: &str, widgets: &[Value], inputs: &mut Map<String, Value>) {
@@ -331,6 +347,46 @@ mod tests {
             .and_then(|v| v.as_object())
             .expect("clip inputs present");
         assert_eq!(clip.get("text").unwrap(), &json!("hello world"));
+    }
+
+    #[test]
+    fn ignores_markdown_note_nodes() {
+        let workflow = json!({
+            "version": 0.4,
+            "nodes": [
+                {
+                    "id": 35,
+                    "type": "MarkdownNote",
+                    "inputs": [],
+                    "outputs": [],
+                    "widgets_values": ["This is a note"]
+                },
+                {
+                    "id": 1,
+                    "type": "EmptyLatentImage",
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "LATENT", "links": [1]}
+                    ],
+                    "widgets_values": [512, 512, 1]
+                },
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [
+                        {"name": "latent_image", "type": "LATENT", "link": 1}
+                    ],
+                    "outputs": [],
+                    "widgets_values": [0, "fixed", 1, 1.0, "euler", "karras", 1.0]
+                }
+            ]
+        });
+
+        let prompt = convert_v04_graph_to_prompt(&workflow).expect("conversion should succeed");
+
+        assert!(!prompt.as_object().unwrap().contains_key("35"));
+        assert!(prompt.as_object().unwrap().contains_key("1"));
+        assert!(prompt.as_object().unwrap().contains_key("2"));
     }
 }
 
