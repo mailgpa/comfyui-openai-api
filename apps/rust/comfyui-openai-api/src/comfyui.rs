@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use rand::Rng;
 use reqwest::{Client, multipart};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,13 +110,227 @@ impl WorkflowsLoader {
                     format!("Failed to parse JSON from {}: {}", file_path.display(), e)
                 })?;
 
+                let normalized_workflow = normalize_workflow(json_value).map_err(|e| {
+                    format!(
+                        "Failed to normalize workflow {}: {}",
+                        file_path.display(),
+                        e
+                    )
+                })?;
+
                 info!("✅ Loaded workflow: {}", filename);
-                workflows.insert(filename, json_value);
+                workflows.insert(filename, normalized_workflow);
             }
         }
 
         info!("📦 Successfully loaded {} workflow(s)", workflows.len());
         Ok(workflows)
+    }
+}
+
+/// Normalize workflows saved with different ComfyUI versions into the API prompt format.
+///
+/// ComfyUI v0.4 saves workflows using the LiteGraph structure (nodes/links arrays). This
+/// converts those graphs into the prompt dictionary expected by the `/prompt` endpoint so
+/// the rest of the proxy can modify nodes as before.
+fn normalize_workflow(workflow: Value) -> Result<Value, String> {
+    if let Some(prompt) = workflow.get("prompt") {
+        return Ok(prompt.clone());
+    }
+
+    let is_v04_graph = workflow.get("nodes").is_some()
+        && workflow
+            .get("version")
+            .and_then(|v| v.as_f64())
+            .map(|v| v >= 0.4)
+            .unwrap_or(true);
+
+    if is_v04_graph {
+        return convert_v04_graph_to_prompt(&workflow);
+    }
+
+    Ok(workflow)
+}
+
+fn convert_v04_graph_to_prompt(workflow: &Value) -> Result<Value, String> {
+    let nodes = workflow
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Workflow missing nodes array".to_string())?;
+
+    // Build lookup so we can resolve link IDs to (node_id, output_name)
+    let mut links: HashMap<i64, (String, String)> = HashMap::new();
+    for node in nodes {
+        if let Some(node_id) = node.get("id").and_then(|v| v.as_i64()) {
+            if let Some(outputs) = node.get("outputs").and_then(|v| v.as_array()) {
+                for output in outputs {
+                    let output_name = output
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("output")
+                        .to_string();
+
+                    if let Some(link_ids) = output.get("links").and_then(|v| v.as_array()) {
+                        for link_id in link_ids {
+                            if let Some(link_id) = link_id.as_i64() {
+                                links.insert(link_id, (node_id.to_string(), output_name.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut prompt: Map<String, Value> = Map::new();
+
+    for node in nodes {
+        let node_id = node
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "Node missing id".to_string())?
+            .to_string();
+
+        let class_type = node
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Node missing type".to_string())?
+            .to_string();
+
+        let mut inputs: Map<String, Value> = Map::new();
+
+        if let Some(input_list) = node.get("inputs").and_then(|v| v.as_array()) {
+            for input in input_list {
+                if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
+                    if let Some(link_id) = input.get("link").and_then(|v| v.as_i64()) {
+                        if let Some((from_node, output_name)) = links.get(&link_id) {
+                            inputs.insert(name.to_string(), json!([from_node, output_name]));
+                        }
+                    } else if let Some(value) = input.get("value") {
+                        inputs.insert(name.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+
+        let widgets = node
+            .get("widgets_values")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        apply_widget_values(&class_type, &widgets, &mut inputs);
+
+        prompt.insert(
+            node_id,
+            json!({
+                "class_type": class_type,
+                "inputs": inputs,
+            }),
+        );
+    }
+
+    Ok(Value::Object(prompt))
+}
+
+fn apply_widget_values(class_type: &str, widgets: &[Value], inputs: &mut Map<String, Value>) {
+    let mapped_inputs: Vec<&str> = match class_type {
+        "KSampler" => vec![
+            "seed",
+            "control_after_generate",
+            "steps",
+            "cfg",
+            "sampler_name",
+            "scheduler",
+            "denoise",
+        ],
+        "CLIPTextEncode" => vec!["text"],
+        "EmptyLatentImage" | "EmptySD3LatentImage" => vec!["width", "height", "batch_size"],
+        "LoadImage" => vec!["image"],
+        _ => vec![],
+    };
+
+    if mapped_inputs.is_empty() {
+        for (idx, value) in widgets.iter().enumerate() {
+            let key = format!("value_{}", idx);
+            inputs.entry(key).or_insert(value.clone());
+        }
+    } else {
+        for (idx, name) in mapped_inputs.iter().enumerate() {
+            if let Some(value) = widgets.get(idx) {
+                inputs.entry((*name).to_string()).or_insert(value.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_v04_workflow_to_prompt() {
+        let workflow = json!({
+            "version": 0.4,
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "EmptyLatentImage",
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "LATENT", "links": [1]}
+                    ],
+                    "widgets_values": [512, 768, 2]
+                },
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [
+                        {"name": "latent_image", "type": "LATENT", "link": 1}
+                    ],
+                    "outputs": [],
+                    "widgets_values": [12345, "randomize", 20, 7.5, "euler", "karras", 1.0]
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "inputs": [],
+                    "outputs": [],
+                    "widgets_values": ["hello world"]
+                }
+            ]
+        });
+
+        let prompt = convert_v04_graph_to_prompt(&workflow).expect("conversion should succeed");
+
+        let sampler = prompt
+            .get("2")
+            .and_then(|v| v.get("inputs"))
+            .and_then(|v| v.as_object())
+            .expect("sampler inputs present");
+
+        assert_eq!(
+            sampler.get("latent_image").unwrap(),
+            &json!(["1", "LATENT"])
+        );
+        assert_eq!(sampler.get("seed").unwrap(), &json!(12345));
+        assert_eq!(sampler.get("steps").unwrap(), &json!(20));
+
+        let latent = prompt
+            .get("1")
+            .and_then(|v| v.get("inputs"))
+            .and_then(|v| v.as_object())
+            .expect("latent inputs present");
+        assert_eq!(latent.get("width").unwrap(), &json!(512));
+        assert_eq!(latent.get("height").unwrap(), &json!(768));
+        assert_eq!(latent.get("batch_size").unwrap(), &json!(2));
+
+        let clip = prompt
+            .get("3")
+            .and_then(|v| v.get("inputs"))
+            .and_then(|v| v.as_object())
+            .expect("clip inputs present");
+        assert_eq!(clip.get("text").unwrap(), &json!("hello world"));
     }
 }
 

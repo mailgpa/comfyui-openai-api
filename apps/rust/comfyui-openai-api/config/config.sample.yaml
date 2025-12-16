@@ -14,7 +14,7 @@ comfyui_backend:
   host: "127.0.0.1"
   port: 8000
   # Path to folder containing .json workflows files
-  workflows_folder: "./workflows"
+  workflows_folder: "/root/comfy/ComfyUI/user/default/workflows"
   # Client ID to use (some string)
   client_id: "comfyui-api"
   # Whether to use or not WebSockets backend
