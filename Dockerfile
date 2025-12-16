@@ -1,8 +1,9 @@
 # Build proxy binary
-FROM rust:1.81-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 WORKDIR /build
 COPY apps/rust/comfyui-openai-api ./comfyui-openai-api
 WORKDIR /build/comfyui-openai-api
+RUN rustup update stable
 RUN cargo build --release
 
 # Runtime image with ComfyUI and proxy
@@ -18,7 +19,7 @@ RUN apt-get update && \
 
 # Install ComfyUI via comfy-cli
 RUN pip install --no-cache-dir comfy-cli
-RUN comfy-cli install
+RUN comfy-cli --skip-prompt install --nvidia
 
 # Proxy binary and assets
 RUN mkdir -p /app/bin /app/config /app/workflows

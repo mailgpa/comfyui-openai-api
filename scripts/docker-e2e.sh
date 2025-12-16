@@ -21,7 +21,7 @@ echo "Building image $IMAGE_TAG..."
 docker build -t "$IMAGE_TAG" .
 
 echo "Starting container $CONTAINER_NAME..."
-docker run -d --rm \
+docker run --gpus=all -d --rm \
   -p "${API_PORT}:8080" \
   -p "${COMFY_PORT}:8188" \
   --name "$CONTAINER_NAME" \
