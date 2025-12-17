@@ -7,7 +7,7 @@ comfyui_backend:
   port: 8188
   client_id: "openai-proxy-client"
   workflows_folder: "/root/comfy/ComfyUI/user/default/workflows"
-  use_ws: true
+  use_ws: false
 routing:
   timeout_seconds: 120
   max_payload_size_mb: 20

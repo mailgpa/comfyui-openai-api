@@ -18,7 +18,7 @@ comfyui_backend:
   # Client ID to use (some string)
   client_id: "comfyui-api"
   # Whether to use or not WebSockets backend
-  use_ws: true
+  use_ws: false
   
 
 # This configures the request routing
