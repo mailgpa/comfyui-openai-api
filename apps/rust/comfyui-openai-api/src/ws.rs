@@ -7,13 +7,20 @@
 //! The connection includes automatic reconnection with exponential backoff to handle
 //! temporary network issues or hung connections.
 
+use futures::{
+    SinkExt,
+    stream::{SplitSink, SplitStream, StreamExt},
+};
 use log::{debug, error, warn};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures::stream::{StreamExt, SplitStream};
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsRead = SplitStream<WsStream>;
 
 /// Maximum number of completed job IDs to keep in memory
 /// Using a circular buffer prevents unbounded memory growth
@@ -91,6 +98,8 @@ pub struct WebSocketManager {
     backend_port: String,
     /// Client ID for reconnection attempts
     client_id: String,
+    /// Write half of the WebSocket connection so we can respond to pings
+    write: Arc<Mutex<SplitSink<WsStream, Message>>>,
 }
 
 impl WebSocketManager {
@@ -129,13 +138,14 @@ impl WebSocketManager {
         debug!("✅ Connected to backend WebSocket");
 
         // Split stream into write and read halves (only use read)
-        let (_write, read) = ws_stream.split();
+        let (write, read) = ws_stream.split();
 
         let manager = Arc::new(WebSocketManager {
             completed_jobs: Mutex::new(CompletedJobsBuffer::new()),
             backend_url: backend_url.clone(),
             backend_port: backend_port.clone(),
             client_id: client_id.clone(),
+            write: Arc::new(Mutex::new(write)),
         });
 
         // Spawn background task to listen for WebSocket messages
@@ -165,55 +175,58 @@ impl WebSocketManager {
     ///
     /// This task runs indefinitely and automatically reconnects on connection loss with
     /// exponential backoff to handle temporary network issues or hung connections.
-    async fn message_listener(
-        mut read: SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-        manager: Arc<WebSocketManager>,
-    ) {
+    async fn message_listener(mut read: WsRead, manager: Arc<WebSocketManager>) {
         let mut retry_delay = Duration::from_secs(INITIAL_RECONNECT_DELAY_SECS);
         let mut retry_count = 0u32;
 
         loop {
             loop {
-                debug!("🔄 Waiting for next WebSocket message..."); 
-                
+                debug!("🔄 Waiting for next WebSocket message...");
+
                 // Use timeout to detect hung connections that never send data
                 match tokio::time::timeout(Duration::from_secs(60), read.next()).await {
                     Ok(Some(Ok(msg))) => {
                         // Reset retry state on successful message
                         retry_count = 0;
                         retry_delay = Duration::from_secs(INITIAL_RECONNECT_DELAY_SECS);
-                        
-                        debug!("📋 Received message type: {:?}", msg); 
-                        // Process text messages only
-                        if let Message::Text(text) = msg {
-                            debug!("📋 Received WS message: {}",text);
-                            // Parse JSON message
-                            if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                                if let Some(msg_type) = json.get("type").and_then(|v| v.as_str()) {
-                                    // Look for execution status messages
-                                    if msg_type == "executing" {
-                                        if let Some(data) = json.get("data").and_then(|v| v.as_object())
-                                        {
-                                            if let Some(prompt_id) =
-                                                data.get("prompt_id").and_then(|v| v.as_str())
+
+                        debug!("📋 Received message type: {:?}", msg);
+                        match msg {
+                            Message::Text(text) => {
+                                debug!("📋 Received WS message: {}", text);
+                                // Parse JSON message
+                                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                    if let Some(msg_type) =
+                                        json.get("type").and_then(|v| v.as_str())
+                                    {
+                                        // Look for execution status messages
+                                        if msg_type == "executing" {
+                                            if let Some(data) =
+                                                json.get("data").and_then(|v| v.as_object())
                                             {
-                                                // Check if node is null (indicates completion)
-                                                if let Some(node) = data.get("node") {
-                                                    if node.is_null() {
-                                                        // Job has completed
-                                                        debug!(
-                                                            "✅ Job completed for prompt_id: {}",
-                                                            prompt_id
-                                                        );
-                                                        // Add to completed jobs buffer
-                                                        let mut jobs = manager.completed_jobs.lock().await;
-                                                        jobs.add(prompt_id.to_string());
-                                                    } else if let Some(node_num) = node.as_str() {
-                                                        // Job is still executing (logging at debug level to avoid spam)
-                                                        debug!(
-                                                            "🔄 Job {} executing node: {}",
-                                                            prompt_id, node_num
-                                                        );
+                                                if let Some(prompt_id) =
+                                                    data.get("prompt_id").and_then(|v| v.as_str())
+                                                {
+                                                    // Check if node is null (indicates completion)
+                                                    if let Some(node) = data.get("node") {
+                                                        if node.is_null() {
+                                                            // Job has completed
+                                                            debug!(
+                                                                "✅ Job completed for prompt_id: {}",
+                                                                prompt_id
+                                                            );
+                                                            // Add to completed jobs buffer
+                                                            let mut jobs =
+                                                                manager.completed_jobs.lock().await;
+                                                            jobs.add(prompt_id.to_string());
+                                                        } else if let Some(node_num) = node.as_str()
+                                                        {
+                                                            // Job is still executing (logging at debug level to avoid spam)
+                                                            debug!(
+                                                                "🔄 Job {} executing node: {}",
+                                                                prompt_id, node_num
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -221,6 +234,19 @@ impl WebSocketManager {
                                     }
                                 }
                             }
+                            Message::Ping(payload) => {
+                                debug!("📡 Received ping from backend, sending pong");
+                                if let Err(e) = WebSocketManager::send_pong(&manager, payload).await
+                                {
+                                    error!("❌ Failed to respond to ping: {}", e);
+                                    break;
+                                }
+                            }
+                            Message::Close(frame) => {
+                                warn!("⚠️ WebSocket close frame received: {:?}", frame);
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                     Ok(Some(Err(e))) => {
@@ -233,13 +259,14 @@ impl WebSocketManager {
                         error!("❌ WebSocket connection closed by server");
                         break; // Exit inner loop to trigger reconnection
                     }
-                    Err(_) => { // Timeout
+                    Err(_) => {
+                        // Timeout
                         debug!("🔄 Recycling WebSocket connection");
                         break; // Exit inner loop to trigger reconnection
                     }
                 }
             }
-            
+
             // Reconnection logic: retry with exponential backoff
             loop {
                 retry_count += 1;
@@ -248,44 +275,46 @@ impl WebSocketManager {
                     retry_count,
                     retry_delay.as_secs()
                 );
-                
+
                 // Wait before attempting reconnection
                 tokio::time::sleep(retry_delay).await;
-                
+
                 // Build WebSocket URL
                 let ws_url = format!(
                     "ws://{}:{}/ws?clientId={}",
                     manager.backend_url, manager.backend_port, manager.client_id
                 );
-                
+
                 // Attempt to reconnect
                 match connect_async(&ws_url).await {
                     Ok((ws_stream, _)) => {
                         debug!("✅ Reconnected to backend WebSocket");
-                        let (_write, new_read) = ws_stream.split();
-                        
+                        let (new_write, new_read) = ws_stream.split();
+
+                        {
+                            let mut write = manager.write.lock().await;
+                            *write = new_write;
+                        }
+
                         // Reset retry state on successful reconnection
                         retry_count = 0;
                         retry_delay = Duration::from_secs(INITIAL_RECONNECT_DELAY_SECS);
-                        
+
                         // Continue listening with the new connection
                         read = new_read;
                         break; // Exit reconnection loop, continue main message loop
                     }
                     Err(e) => {
                         error!("❌ Reconnection failed: {}", e);
-                        
+
                         // Calculate next retry delay with exponential backoff
-                        let next_delay_secs = 
-                            (retry_delay.as_secs_f64() * RECONNECT_BACKOFF_MULTIPLIER)
-                                .min(MAX_RECONNECT_DELAY_SECS as f64);
+                        let next_delay_secs = (retry_delay.as_secs_f64()
+                            * RECONNECT_BACKOFF_MULTIPLIER)
+                            .min(MAX_RECONNECT_DELAY_SECS as f64);
                         retry_delay = Duration::from_secs_f64(next_delay_secs);
-                        
-                        warn!(
-                            "⏱️ Next reconnection attempt in {}s",
-                            retry_delay.as_secs()
-                        );
-                        
+
+                        warn!("⏱️ Next reconnection attempt in {}s", retry_delay.as_secs());
+
                         // Continue looping to retry reconnection
                     }
                 }
@@ -309,7 +338,10 @@ impl WebSocketManager {
     /// # Blocking Behavior
     /// This function runs in an async context but blocks the async task.
     /// It should only be called from async contexts (like within Axum handlers).
-    pub async fn wait_for_job_completion(&self, prompt_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn wait_for_job_completion(
+        &self,
+        prompt_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("⏳ Waiting for job completion for prompt_id: {}", prompt_id);
 
         loop {
@@ -321,11 +353,20 @@ impl WebSocketManager {
                     return Ok(());
                 }
             }
-           
 
             // Sleep briefly to avoid busy waiting
             // Yields control to other async tasks
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Respond to WebSocket ping frames to keep the connection alive
+    async fn send_pong(
+        manager: &Arc<WebSocketManager>,
+        payload: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut write = manager.write.lock().await;
+        write.send(Message::Pong(payload)).await?;
+        Ok(())
     }
 }

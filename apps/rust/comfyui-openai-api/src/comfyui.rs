@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use rand::Rng;
 use reqwest::{Client, multipart};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -128,156 +128,17 @@ impl WorkflowsLoader {
     }
 }
 
-/// Normalize workflows saved with different ComfyUI versions into the API prompt format.
+/// Normalize workflows saved from ComfyUI into the API prompt format.
 ///
-/// ComfyUI v0.4 saves workflows using the LiteGraph structure (nodes/links arrays). This
-/// converts those graphs into the prompt dictionary expected by the `/prompt` endpoint so
-/// the rest of the proxy can modify nodes as before.
+/// Workflows exported with "Export (API)" include a top-level `prompt` field that already
+/// matches the structure expected by the ComfyUI `/prompt` endpoint. We simply pluck that
+/// prompt when present and otherwise use the workflow as-is.
 fn normalize_workflow(workflow: Value) -> Result<Value, String> {
     if let Some(prompt) = workflow.get("prompt") {
         return Ok(prompt.clone());
     }
 
-    let is_v04_graph = workflow.get("nodes").is_some()
-        && workflow
-            .get("version")
-            .and_then(|v| v.as_f64())
-            .map(|v| v >= 0.4)
-            .unwrap_or(true);
-
-    if is_v04_graph {
-        return convert_v04_graph_to_prompt(&workflow);
-    }
-
     Ok(workflow)
-}
-
-fn convert_v04_graph_to_prompt(workflow: &Value) -> Result<Value, String> {
-    let nodes = workflow
-        .get("nodes")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "Workflow missing nodes array".to_string())?;
-
-    // Build lookup so we can resolve link IDs to (node_id, output_name)
-    let mut links: HashMap<i64, (String, String)> = HashMap::new();
-    for node in nodes {
-        let Some(class_type) = node.get("type").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        if should_ignore_node(class_type) {
-            continue;
-        }
-
-        if let Some(node_id) = node.get("id").and_then(|v| v.as_i64()) {
-            if let Some(outputs) = node.get("outputs").and_then(|v| v.as_array()) {
-                for output in outputs {
-                    let output_name = output
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("output")
-                        .to_string();
-
-                    if let Some(link_ids) = output.get("links").and_then(|v| v.as_array()) {
-                        for link_id in link_ids {
-                            if let Some(link_id) = link_id.as_i64() {
-                                links.insert(link_id, (node_id.to_string(), output_name.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut prompt: Map<String, Value> = Map::new();
-
-    for node in nodes {
-        let node_id = node
-            .get("id")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| "Node missing id".to_string())?
-            .to_string();
-
-        let class_type = node
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Node missing type".to_string())?
-            .to_string();
-
-        if should_ignore_node(&class_type) {
-            continue;
-        }
-
-        let mut inputs: Map<String, Value> = Map::new();
-
-        if let Some(input_list) = node.get("inputs").and_then(|v| v.as_array()) {
-            for input in input_list {
-                if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
-                    if let Some(link_id) = input.get("link").and_then(|v| v.as_i64()) {
-                        if let Some((from_node, output_name)) = links.get(&link_id) {
-                            inputs.insert(name.to_string(), json!([from_node, output_name]));
-                        }
-                    } else if let Some(value) = input.get("value") {
-                        inputs.insert(name.to_string(), value.clone());
-                    }
-                }
-            }
-        }
-
-        let widgets = node
-            .get("widgets_values")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        apply_widget_values(&class_type, &widgets, &mut inputs);
-
-        prompt.insert(
-            node_id,
-            json!({
-                "class_type": class_type,
-                "inputs": inputs,
-            }),
-        );
-    }
-
-    Ok(Value::Object(prompt))
-}
-
-fn should_ignore_node(class_type: &str) -> bool {
-    matches!(class_type, "MarkdownNote" | "Note")
-}
-
-fn apply_widget_values(class_type: &str, widgets: &[Value], inputs: &mut Map<String, Value>) {
-    let mapped_inputs: Vec<&str> = match class_type {
-        "KSampler" => vec![
-            "seed",
-            "control_after_generate",
-            "steps",
-            "cfg",
-            "sampler_name",
-            "scheduler",
-            "denoise",
-        ],
-        "CLIPTextEncode" => vec!["text"],
-        "EmptyLatentImage" | "EmptySD3LatentImage" => vec!["width", "height", "batch_size"],
-        "LoadImage" => vec!["image"],
-        _ => vec![],
-    };
-
-    if mapped_inputs.is_empty() {
-        for (idx, value) in widgets.iter().enumerate() {
-            let key = format!("value_{}", idx);
-            inputs.entry(key).or_insert(value.clone());
-        }
-    } else {
-        for (idx, name) in mapped_inputs.iter().enumerate() {
-            if let Some(value) = widgets.get(idx) {
-                inputs.entry((*name).to_string()).or_insert(value.clone());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -285,108 +146,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_v04_workflow_to_prompt() {
+    fn extracts_prompt_field_when_present() {
         let workflow = json!({
-            "version": 0.4,
-            "nodes": [
-                {
-                    "id": 1,
-                    "type": "EmptyLatentImage",
-                    "inputs": [],
-                    "outputs": [
-                        {"name": "LATENT", "links": [1]}
-                    ],
-                    "widgets_values": [512, 768, 2]
-                },
-                {
-                    "id": 2,
-                    "type": "KSampler",
-                    "inputs": [
-                        {"name": "latent_image", "type": "LATENT", "link": 1}
-                    ],
-                    "outputs": [],
-                    "widgets_values": [12345, "randomize", 20, 7.5, "euler", "karras", 1.0]
-                },
-                {
-                    "id": 3,
-                    "type": "CLIPTextEncode",
-                    "inputs": [],
-                    "outputs": [],
-                    "widgets_values": ["hello world"]
-                }
-            ]
+            "prompt": {"1": {"class_type": "Test", "inputs": {}}}
         });
 
-        let prompt = convert_v04_graph_to_prompt(&workflow).expect("conversion should succeed");
+        let prompt = normalize_workflow(workflow).expect("prompt extraction should succeed");
 
-        let sampler = prompt
-            .get("2")
-            .and_then(|v| v.get("inputs"))
-            .and_then(|v| v.as_object())
-            .expect("sampler inputs present");
-
-        assert_eq!(
-            sampler.get("latent_image").unwrap(),
-            &json!(["1", "LATENT"])
-        );
-        assert_eq!(sampler.get("seed").unwrap(), &json!(12345));
-        assert_eq!(sampler.get("steps").unwrap(), &json!(20));
-
-        let latent = prompt
-            .get("1")
-            .and_then(|v| v.get("inputs"))
-            .and_then(|v| v.as_object())
-            .expect("latent inputs present");
-        assert_eq!(latent.get("width").unwrap(), &json!(512));
-        assert_eq!(latent.get("height").unwrap(), &json!(768));
-        assert_eq!(latent.get("batch_size").unwrap(), &json!(2));
-
-        let clip = prompt
-            .get("3")
-            .and_then(|v| v.get("inputs"))
-            .and_then(|v| v.as_object())
-            .expect("clip inputs present");
-        assert_eq!(clip.get("text").unwrap(), &json!("hello world"));
+        assert_eq!(prompt.get("1").unwrap(), &json!({"class_type": "Test", "inputs": {}}));
     }
 
     #[test]
-    fn ignores_markdown_note_nodes() {
+    fn returns_workflow_when_prompt_missing() {
         let workflow = json!({
-            "version": 0.4,
-            "nodes": [
-                {
-                    "id": 35,
-                    "type": "MarkdownNote",
-                    "inputs": [],
-                    "outputs": [],
-                    "widgets_values": ["This is a note"]
-                },
-                {
-                    "id": 1,
-                    "type": "EmptyLatentImage",
-                    "inputs": [],
-                    "outputs": [
-                        {"name": "LATENT", "links": [1]}
-                    ],
-                    "widgets_values": [512, 512, 1]
-                },
-                {
-                    "id": 2,
-                    "type": "KSampler",
-                    "inputs": [
-                        {"name": "latent_image", "type": "LATENT", "link": 1}
-                    ],
-                    "outputs": [],
-                    "widgets_values": [0, "fixed", 1, 1.0, "euler", "karras", 1.0]
-                }
-            ]
+            "some": "workflow"
         });
 
-        let prompt = convert_v04_graph_to_prompt(&workflow).expect("conversion should succeed");
+        let prompt = normalize_workflow(workflow.clone()).expect("normalization should succeed");
 
-        assert!(!prompt.as_object().unwrap().contains_key("35"));
-        assert!(prompt.as_object().unwrap().contains_key("1"));
-        assert!(prompt.as_object().unwrap().contains_key("2"));
+        assert_eq!(prompt, workflow);
     }
 }
 
@@ -727,28 +505,26 @@ async fn create_json_payload(
                                         openai_request.get("size").and_then(|v| v.as_str())
                                     {
                                         debug!("✏️ Requested image size: {}", size_data);
-                                        // Parse "1024x1024" format to width and height
-                                        let size_data_split: Vec<i32> = size_data
-                                            .split('x')
-                                            .map(|p| p.parse().unwrap_or(512))
-                                            .collect();
 
-                                        inputs_data_size.insert(
-                                            "width".to_string(),
-                                            Value::String(
-                                                size_data_split.get(0).unwrap_or(&512).to_string(),
-                                            ),
-                                        );
-                                        inputs_data_size.insert(
-                                            "height".to_string(),
-                                            Value::String(
-                                                size_data_split.get(1).unwrap_or(&512).to_string(),
-                                            ),
-                                        );
+                                        if let Some((width, height)) = parse_size(size_data) {
+                                            inputs_data_size.insert(
+                                                "width".to_string(),
+                                                Value::String(width.to_string()),
+                                            );
+                                            inputs_data_size.insert(
+                                                "height".to_string(),
+                                                Value::String(height.to_string()),
+                                            );
+                                        } else {
+                                            warn!(
+                                                "⚠️ Invalid size format '{}', keeping workflow defaults",
+                                                size_data
+                                            );
+                                        }
                                     } else {
-                                        return Err(ProxyError::Json(format!(
-                                            "Failed to get size from JSON"
-                                        )));
+                                        debug!(
+                                            "No size provided in request, keeping workflow defaults"
+                                        );
                                     }
 
                                     // Set batch size (number of images to generate)
@@ -1332,4 +1108,14 @@ async fn check_queue(
     }
 
     Ok(true)
+}
+/// Parse an OpenAI-style size string (e.g., "1024x1024") into width and height.
+fn parse_size(size_data: &str) -> Option<(i32, i32)> {
+    let lower = size_data.to_lowercase();
+    let mut parts = lower.split('x').filter_map(|p| p.parse::<i32>().ok());
+
+    match (parts.next(), parts.next()) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+        _ => None,
+    }
 }
