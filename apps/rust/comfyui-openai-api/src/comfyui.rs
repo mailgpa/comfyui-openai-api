@@ -110,35 +110,14 @@ impl WorkflowsLoader {
                     format!("Failed to parse JSON from {}: {}", file_path.display(), e)
                 })?;
 
-                let normalized_workflow = normalize_workflow(json_value).map_err(|e| {
-                    format!(
-                        "Failed to normalize workflow {}: {}",
-                        file_path.display(),
-                        e
-                    )
-                })?;
-
                 info!("✅ Loaded workflow: {}", filename);
-                workflows.insert(filename, normalized_workflow);
+                workflows.insert(filename, json_value);
             }
         }
 
         info!("📦 Successfully loaded {} workflow(s)", workflows.len());
         Ok(workflows)
     }
-}
-
-/// Normalize workflows saved from ComfyUI into the API prompt format.
-///
-/// Workflows exported with "Export (API)" include a top-level `prompt` field that already
-/// matches the structure expected by the ComfyUI `/prompt` endpoint. We simply pluck that
-/// prompt when present and otherwise use the workflow as-is.
-fn normalize_workflow(workflow: Value) -> Result<Value, String> {
-    if let Some(prompt) = workflow.get("prompt") {
-        return Ok(prompt.clone());
-    }
-
-    Ok(workflow)
 }
 
 #[cfg(test)]
