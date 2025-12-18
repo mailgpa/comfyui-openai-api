@@ -14,11 +14,11 @@ WORKDIR /app
 
 # System dependencies for building and networking utilities
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git curl ca-certificates pkg-config libssl-dev netcat-openbsd && \
+    apt-get install -y --no-install-recommends git curl ca-certificates pkg-config libssl-dev netcat-openbsd libgl1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install ComfyUI via comfy-cli
-RUN pip install --no-cache-dir comfy-cli
+RUN pip install --no-cache-dir comfy-cli opencv-python-headless PyWavelets matplotlib
 RUN comfy-cli --skip-prompt install --nvidia
 
 # Proxy binary and assets

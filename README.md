@@ -270,15 +270,16 @@ automatically.
 
 You will find example workflows in  `./workflows`. Please download the model's weights and place them in the correct folders before trying to use them!
 
-### Node Replacement
+### Node Replacement (ComfyLiterals support)
 
-The proxy automatically modifies specific nodes:
+The proxy automatically modifies workflow nodes to inject parameters from the OpenAI request. It now supports workflows that use the ComfyLiterals extension (primitive nodes) as well as the traditional node types:
 
-- **EmptyLatentImage / EmptySD3LatentImage**: Updates `width`, `height`, `batch_size`
-- **CLIPTextEncode (Positive Prompt)**: Updates `text` with prompt
-- **CLIPTextEncode (Negative Prompt)**: Updates `text` with negative_prompt
+- **ComfyLiterals `Int` nodes** (e.g. nodes with `class_type: "Int"` and `_meta.title` like `Seed`, `Width`, `Height`, `batch_size`): the proxy detects these by title (or node id) and injects the corresponding numeric values (seed, width, height, batch_size). Many ComfyLiterals Int nodes store their value under keys like `Number` — the proxy will replace the first numeric-like input value found.
+- **ComfyLiterals string-literal nodes** (class types containing `String`, e.g. `KepStringLiteral`): these are used for prompt-like text. The proxy detects Positive/Negative prompt nodes by `_meta.title` (e.g. `Positive Prompt`, `Negative Prompt`) or by node name and injects `prompt`/`negative_prompt` into the first string input.
+- **LoadImage**: If your workflow includes a `LoadImage` node, the proxy will upload the provided base64 image and insert its filename into the node's `image` input so img2img workflows work seamlessly.
+- **CLIPTextEncode**: Legacy handling is preserved — Positive/Negative `CLIPTextEncode` nodes (by `_meta.title`) continue to receive `prompt`/`negative_prompt` injected into their `text` input.
 
-If you workflow needs other nodes to be modified, you can open an issue!
+If your workflow needs other nodes to be modified, please open an issue or submit a PR with a suggested mapping.
 
 ## Project Structure
 

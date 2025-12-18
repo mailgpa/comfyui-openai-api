@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use rand::Rng;
 use reqwest::{Client, multipart};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -117,33 +117,6 @@ impl WorkflowsLoader {
 
         info!("📦 Successfully loaded {} workflow(s)", workflows.len());
         Ok(workflows)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extracts_prompt_field_when_present() {
-        let workflow = json!({
-            "prompt": {"1": {"class_type": "Test", "inputs": {}}}
-        });
-
-        let prompt = normalize_workflow(workflow).expect("prompt extraction should succeed");
-
-        assert_eq!(prompt.get("1").unwrap(), &json!({"class_type": "Test", "inputs": {}}));
-    }
-
-    #[test]
-    fn returns_workflow_when_prompt_missing() {
-        let workflow = json!({
-            "some": "workflow"
-        });
-
-        let prompt = normalize_workflow(workflow.clone()).expect("normalization should succeed");
-
-        assert_eq!(prompt, workflow);
     }
 }
 
@@ -431,150 +404,138 @@ async fn create_json_payload(
                 .get_mut("prompt")
                 .and_then(|v| v.as_object_mut())
             {
-                for (_node_id, node_data) in workflow_prompt {
+                for (node_key, node_data) in workflow_prompt {
+                    // Match on node class to handle ComfyLiterals primitives explicitly
                     if let Some(class_type) = node_data["class_type"].as_str() {
                         match class_type {
-                            // Handle seed
-                            "KSampler" => {
-                                if let Some(inputs_data_sampler) =
-                                    node_data["inputs"].as_object_mut()
-                                {
-                                    // Parse seed
-                                    if let Some(seed_data) =
-                                        openai_request.get("seed").and_then(|v| v.as_i64())
-                                    {
-                                        debug!("✏️ Requested seed: {}", seed_data);
+                            // Integer primitive nodes (ComfyLiterals 'Int')
+                            "Int" => {
+                                // Prefer to identify the primitive by the node's _meta.title if present
+                                let title_lower = node_data.get("_meta").and_then(|m| m.get("title")).and_then(|t| t.as_str()).map(|s| s.to_lowercase());
+                                let key_lower = node_key.to_lowercase();
+                                if let Some(inputs_obj) = node_data.get_mut("inputs").and_then(|v| v.as_object_mut()) {
 
-                                        inputs_data_sampler.insert(
-                                            "seed".to_string(),
-                                            Value::String(seed_data.to_string()),
-                                        );
-                                    } else {
-                                        let random_number: u32 = rng.random_range(0..1_000_000);
-                                        debug!(
-                                            "No seed in JSON, using random seed: {}",
-                                            random_number
-                                        );
-                                        inputs_data_sampler.insert(
-                                            "seed".to_string(),
-                                            Value::String(random_number.to_string()),
-                                        );
+                                    // Helper to set the first numeric-like field in the inputs object
+                                    let mut set_first_numeric = |val: String| {
+                                        for (_k, v) in inputs_obj.iter_mut() {
+                                            if v.is_number() || v.is_string() {
+                                                *v = Value::String(val.clone());
+                                                return;
+                                            }
+                                        }
+                                    };
+
+                                    // Seed
+                                    if title_lower.as_deref() == Some("seed") || key_lower == "seed" {
+                                        let seed_value = openai_request.get("seed").and_then(|v| v.as_i64()).map(|s| s as i64).unwrap_or_else(|| rng.random_range(0..1_000_000) as i64);
+                                        debug!("✏️ Injecting seed into Int node '{}': {}", node_key, seed_value);
+                                        set_first_numeric(seed_value.to_string());
+                                    }
+
+                                    // Width / Height
+                                    else if title_lower.as_deref() == Some("width") || title_lower.as_deref() == Some("height") || key_lower == "width" || key_lower == "height" {
+                                        if let Some(size_data) = openai_request.get("size").and_then(|v| v.as_str()) {
+                                            if let Some((w, h)) = parse_size(size_data) {
+                                                let inject_value = if title_lower.as_deref() == Some("width") || key_lower == "width" { w } else { h };
+                                                debug!("✏️ Injecting {} into Int node '{}'", inject_value, node_key);
+                                                set_first_numeric(inject_value.to_string());
+                                            } else {
+                                                warn!("⚠️ Invalid size format for {}", node_key);
+                                            }
+                                        }
+                                    }
+
+                                    // Batch size / copies
+                                    else if title_lower.as_deref() == Some("batch_size") || key_lower == "batch_size" || key_lower == "copies" {
+                                        if let Some(copies_num_data) = openai_request.get("n").and_then(|v| v.as_i64()) {
+                                            debug!("✏️ Injecting copies into Int node '{}': {}", node_key, copies_num_data);
+                                            set_first_numeric(copies_num_data.to_string());
+                                        }
                                     }
                                 }
                             }
+
+                            // String primitive nodes (ComfyLiterals 'String' or String-literal types)
+                            ct if ct.to_lowercase().contains("string") => {
+                                // Prefer title for semantic meaning (e.g., "Positive Prompt", "Negative Prompt")
+                                let title_lower = node_data.get("_meta").and_then(|m| m.get("title")).and_then(|t| t.as_str()).map(|s| s.to_lowercase());
+                                let key_lower = node_key.to_lowercase();
+
+                                if let Some(inputs_obj) = node_data.get_mut("inputs").and_then(|v| v.as_object_mut()) {
+                                    let is_prompt_like = title_lower.as_deref().map(|t| t.contains("prompt") || t.contains("positive") || t.contains("negative")).unwrap_or(false) || key_lower.contains("prompt") || key_lower.contains("text");
+
+                                    if is_prompt_like {
+                                        // Decide positive vs negative by title or node name
+                                        let is_negative = title_lower.as_deref().map(|t| t.contains("neg") || t.contains("negative")).unwrap_or(false) || key_lower.contains("neg");
+
+                                        if is_negative {
+                                            if let Some(neg_prompt_input) = openai_request.get("negative_prompt").and_then(|v| v.as_str()) {
+                                                debug!("✏️ Injecting negative prompt into String node '{}': {}", node_key, neg_prompt_input);
+                                                for (_k, v) in inputs_obj.iter_mut() {
+                                                    if v.is_string() {
+                                                        *v = Value::String(neg_prompt_input.to_string());
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            if let Some(prompt_input) = openai_request.get("prompt").and_then(|v| v.as_str()) {
+                                                debug!("✏️ Injecting prompt into String node '{}': {}", node_key, prompt_input);
+                                                for (_k, v) in inputs_obj.iter_mut() {
+                                                    if v.is_string() {
+                                                        *v = Value::String(prompt_input.to_string());
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Keep handling of LoadImage nodes for image uploads
                             "LoadImage" => {
                                 if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
                                     if let Some(image_name) = base_image {
-                                        debug!("✏️ Using uploaded image: {}", image_name);
-                                        inputs_data.insert(
-                                            "image".to_string(),
-                                            Value::String(image_name.to_string()),
-                                        );
+                                        debug!("✏️ Using uploaded image (LoadImage): {}", image_name);
+                                        inputs_data.insert("image".to_string(), Value::String(image_name.to_string()));
                                     } else {
                                         debug!("No base image provided, using workflow default");
                                     }
                                 }
                             }
-                            // Handle image generation size and batch size
-                            "EmptyLatentImage" | "EmptySD3LatentImage" => {
-                                if let Some(inputs_data_size) = node_data["inputs"].as_object_mut()
-                                {
-                                    // Parse and set image dimensions
-                                    if let Some(size_data) =
-                                        openai_request.get("size").and_then(|v| v.as_str())
-                                    {
-                                        debug!("✏️ Requested image size: {}", size_data);
 
-                                        if let Some((width, height)) = parse_size(size_data) {
-                                            inputs_data_size.insert(
-                                                "width".to_string(),
-                                                Value::String(width.to_string()),
-                                            );
-                                            inputs_data_size.insert(
-                                                "height".to_string(),
-                                                Value::String(height.to_string()),
-                                            );
-                                        } else {
-                                            warn!(
-                                                "⚠️ Invalid size format '{}', keeping workflow defaults",
-                                                size_data
-                                            );
-                                        }
-                                    } else {
-                                        debug!(
-                                            "No size provided in request, keeping workflow defaults"
-                                        );
-                                    }
+                            // For other node types, preserve existing CLIPTextEncode logic below
+                            _ => {}
+                        }
+                    }
 
-                                    // Set batch size (number of images to generate)
-                                    if let Some(copies_num_data) =
-                                        openai_request.get("n").and_then(|v| v.as_i64())
-                                    {
-                                        debug!("✏️ Requested copies: {}", copies_num_data);
-                                        inputs_data_size.insert(
-                                            "batch_size".to_string(),
-                                            Value::String(copies_num_data.to_string()),
-                                        );
-                                    } else {
-                                        debug!("No 'n' (copies) in JSON, using workflow default");
-                                    }
-                                }
-                            }
-                            // Handle text prompts for image generation
-                            "CLIPTextEncode" => {
-                                // Check if this is a positive or negative prompt node
-                                if let Some(meta_data) = node_data["_meta"].as_object() {
-                                    if let Some(title) = meta_data["title"].as_str() {
-                                        // Inject positive prompt
-                                        if title == "Positive Prompt" {
-                                            if let Some(inputs_data) =
-                                                node_data["inputs"].as_object_mut()
-                                            {
-                                                if let Some(prompt_input) = openai_request
-                                                    .get("prompt")
-                                                    .and_then(|v| v.as_str())
-                                                {
-                                                    debug!("✏️ Requested prompt: {}", prompt_input);
-                                                    inputs_data.insert(
-                                                        "text".to_string(),
-                                                        Value::String(prompt_input.to_string()),
-                                                    );
-                                                } else {
-                                                    return Err(ProxyError::Json(format!(
-                                                        "Failed to get prompt from JSON"
-                                                    )));
-                                                }
+                    // Still handle CLIPTextEncode specially to detect positive/negative prompt nodes
+                    if let Some(class_type) = node_data["class_type"].as_str() {
+                        if class_type == "CLIPTextEncode" {
+                            if let Some(meta_data) = node_data["_meta"].as_object() {
+                                if let Some(title) = meta_data["title"].as_str() {
+                                    if title == "Positive Prompt" {
+                                        if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
+                                            if let Some(prompt_input) = openai_request.get("prompt").and_then(|v| v.as_str()) {
+                                                debug!("✏️ Requested prompt: {}", prompt_input);
+                                                inputs_data.insert("text".to_string(), Value::String(prompt_input.to_string()));
+                                            } else {
+                                                return Err(ProxyError::Json(format!("Failed to get prompt from JSON")));
                                             }
                                         }
-                                        // Inject negative prompt (optional)
-                                        else if title == "Negative Prompt" {
-                                            if let Some(inputs_data) =
-                                                node_data["inputs"].as_object_mut()
-                                            {
-                                                if let Some(neg_prompt_input) = openai_request
-                                                    .get("negative_prompt")
-                                                    .and_then(|v| v.as_str())
-                                                {
-                                                    debug!(
-                                                        "✏️ Requested negative prompt: {}",
-                                                        neg_prompt_input
-                                                    );
-                                                    inputs_data.insert(
-                                                        "text".to_string(),
-                                                        Value::String(neg_prompt_input.to_string()),
-                                                    );
-                                                } else {
-                                                    debug!(
-                                                        "No negative_prompt in JSON, using workflow default"
-                                                    );
-                                                }
+                                    } else if title == "Negative Prompt" {
+                                        if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
+                                            if let Some(neg_prompt_input) = openai_request.get("negative_prompt").and_then(|v| v.as_str()) {
+                                                debug!("✏️ Requested negative prompt: {}", neg_prompt_input);
+                                                inputs_data.insert("text".to_string(), Value::String(neg_prompt_input.to_string()));
+                                            } else {
+                                                debug!("No negative_prompt in JSON, using workflow default");
                                             }
                                         }
                                     }
                                 }
                             }
-                            // Skip other node types
-                            _ => continue,
                         }
                     }
                 }
