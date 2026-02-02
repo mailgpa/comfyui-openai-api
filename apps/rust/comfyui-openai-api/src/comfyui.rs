@@ -671,6 +671,21 @@ async fn handle_regular_response(
 
     debug!("📥 Response body: {} bytes", body_bytes.len());
 
+    // Handle non-success status codes
+    if !status.is_success() {
+        let error_msg = String::from_utf8_lossy(&body_bytes);
+        error!("❌ ComfyUI backend returned error status {}: {}", status, error_msg);
+        
+        // Try to parse as JSON to get more details
+        if let Ok(json_error) = serde_json::from_slice::<Value>(&body_bytes) {
+             if let Some(error_detail) = json_error.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                 return Err(ProxyError::Upstream(format!("ComfyUI error: {}", error_detail)));
+             }
+        }
+        
+        return Err(ProxyError::Upstream(format!("ComfyUI backend returned error status {}", status)));
+    }
+
     // Parse backend response as JSON
     let json: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
@@ -846,10 +861,17 @@ async fn retrieve_image_from_history(
         }
     };
 
-    // Parse history response
+    let status = upstream_response.status();
     let response_body = upstream_response.bytes().await.map_err(|e| {
         ProxyError::Upstream(format!("Failed to read history response body: {}", e))
     })?;
+
+    if !status.is_success() {
+        let error_msg = String::from_utf8_lossy(&response_body);
+        error!("❌ ComfyUI history returned error status {}: {}", status, error_msg);
+        return Err(ProxyError::Upstream(format!("ComfyUI history error (status {})", status)));
+    }
+
     let history_json: Value = serde_json::from_slice(&response_body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse history JSON: {}", e)))?;
 
@@ -1034,11 +1056,18 @@ async fn check_queue(
         }
     };
 
-    // Parse history response
+    let status = upstream_response.status();
     let response_body = upstream_response
         .bytes()
         .await
         .map_err(|e| ProxyError::Upstream(format!("Failed to read queu response body: {}", e)))?;
+
+    if !status.is_success() {
+        let error_msg = String::from_utf8_lossy(&response_body);
+        error!("❌ ComfyUI queue returned error status {}: {}", status, error_msg);
+        return Err(ProxyError::Upstream(format!("ComfyUI queue error (status {})", status)));
+    }
+
     let queu_json: Value = serde_json::from_slice(&response_body)
         .map_err(|e| ProxyError::Json(format!("Failed to queu history JSON: {}", e)))?;
 
