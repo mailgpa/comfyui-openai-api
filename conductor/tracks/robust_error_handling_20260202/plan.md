@@ -7,6 +7,9 @@
 - [x] Task: Implement validation logic for Image Edit (img2img) requests [cfc5bee]
     - [x] Write unit tests for edit request validation
     - [x] Implement validation and base64 format checking
+- [x] Task: Integrate validation into HTTP handlers [7695e0c]
+    - [x] Update `/v1/images/generations` and `/v1/images/edits` handlers to use validation functions
+    - [x] Ensure HTTP 400 is returned for invalid requests
 - [ ] Task: Conductor - User Manual Verification 'Phase 1: Request Validation' (Protocol in workflow.md)
 
 ## Phase 2: Error Mapping and Transformation
