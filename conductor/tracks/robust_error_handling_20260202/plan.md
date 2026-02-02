@@ -18,6 +18,6 @@
 - [x] Task: Map ComfyUI backend errors to OpenAI format [1be8e5c]
     - [x] Write tests for backend error translation
     - [x] Update `comfyui.rs` to handle and transform errors from Reqwest and WebSocket
-- [ ] Task: Improve timeout handling
-    - [ ] Ensure timeouts return a 504 Gateway Timeout in OpenAI format
+- [x] Task: Improve timeout handling [958ce80]
+    - [x] Ensure timeouts return a 504 Gateway Timeout in OpenAI format
 - [ ] Task: Conductor - User Manual Verification 'Phase 2: Error Mapping and Transformation' (Protocol in workflow.md)
