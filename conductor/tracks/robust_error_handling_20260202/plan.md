@@ -15,9 +15,9 @@
 ## Phase 2: Error Mapping and Transformation
 - [x] Task: Define OpenAI-compatible error response structures [ff5cef0]
     - [x] Create shared error structs in `proxy.rs` or `comfyui.rs`
-- [ ] Task: Map ComfyUI backend errors to OpenAI format
-    - [ ] Write tests for backend error translation
-    - [ ] Update `comfyui.rs` to handle and transform errors from Reqwest and WebSocket
+- [x] Task: Map ComfyUI backend errors to OpenAI format [1be8e5c]
+    - [x] Write tests for backend error translation
+    - [x] Update `comfyui.rs` to handle and transform errors from Reqwest and WebSocket
 - [ ] Task: Improve timeout handling
     - [ ] Ensure timeouts return a 504 Gateway Timeout in OpenAI format
 - [ ] Task: Conductor - User Manual Verification 'Phase 2: Error Mapping and Transformation' (Protocol in workflow.md)
