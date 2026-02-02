@@ -56,6 +56,8 @@ pub enum ProxyError {
     Internal(String),
     /// Upstream/backend errors (502)
     Upstream(String),
+    /// Timeout errors (504)
+    Timeout(String),
     /// JSON parsing/serialization errors (400)
     Json(String),
     /// Request validation errors (400)
@@ -110,6 +112,10 @@ impl IntoResponse for ProxyError {
             ProxyError::Upstream(msg) => {
                 error!("❌ Upstream error: {}", msg);
                 (StatusCode::BAD_GATEWAY, "upstream_error", msg, None)
+            }
+            ProxyError::Timeout(msg) => {
+                error!("❌ Timeout error: {}", msg);
+                (StatusCode::GATEWAY_TIMEOUT, "request_timeout", msg, None)
             }
             ProxyError::Json(msg) => {
                 error!("❌ JSON error: {}", msg);
@@ -182,7 +188,7 @@ pub fn handle_timeout_error(full_url: &str, timeout_duration: Duration) -> Proxy
         "❌ Request timed out after {} seconds",
         timeout_duration.as_secs()
     );
-    ProxyError::Upstream(format!(
+    ProxyError::Timeout(format!(
         "Request hung/timed out after {} seconds to {}",
         timeout_duration.as_secs(),
         full_url
