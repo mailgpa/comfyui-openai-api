@@ -10,7 +10,7 @@
 - [x] Task: Integrate validation into HTTP handlers [7695e0c]
     - [x] Update `/v1/images/generations` and `/v1/images/edits` handlers to use validation functions
     - [x] Ensure HTTP 400 is returned for invalid requests
-- [ ] Task: Conductor - User Manual Verification 'Phase 1: Request Validation' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 1: Request Validation' (Protocol in workflow.md)
 
 ## Phase 2: Error Mapping and Transformation
 - [ ] Task: Define OpenAI-compatible error response structures
