@@ -4,6 +4,7 @@
 //! manages image generation requests, and retrieves generated images from the backend.
 
 use crate::ws::WebSocketManager;
+use crate::validation::{validate_generation_request, validate_edit_request, GenerateImageRequest, EditImageRequest};
 use axum::{
     body::{Body, Bytes},
     extract::{Query, State},
@@ -203,6 +204,17 @@ async fn process_generation_request(
 
     let openai_request: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+
+    // Validate request
+    if require_image {
+        let req: EditImageRequest = serde_json::from_value(openai_request.clone())
+            .map_err(|e| ProxyError::Validation(format!("Invalid edit request format: {}", e)))?;
+        validate_edit_request(&req)?;
+    } else {
+        let req: GenerateImageRequest = serde_json::from_value(openai_request.clone())
+            .map_err(|e| ProxyError::Validation(format!("Invalid generation request format: {}", e)))?;
+        validate_generation_request(&req)?;
+    }
 
     let mut base_image_name: Option<String> = None;
 
