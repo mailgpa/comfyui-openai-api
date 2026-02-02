@@ -1,6 +1,6 @@
 # Implementation Plan: Enhanced Error Handling and Request Validation
 
-## Phase 1: Request Validation
+## Phase 1: Request Validation [checkpoint: d735b55]
 - [x] Task: Implement validation logic for Image Generation requests [73805a9]
     - [x] Write unit tests for generation request validation
     - [x] Implement validation in `proxy.rs` or a dedicated module
