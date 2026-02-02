@@ -13,8 +13,8 @@
 - [x] Task: Conductor - User Manual Verification 'Phase 1: Request Validation' (Protocol in workflow.md)
 
 ## Phase 2: Error Mapping and Transformation
-- [ ] Task: Define OpenAI-compatible error response structures
-    - [ ] Create shared error structs in `proxy.rs` or `comfyui.rs`
+- [x] Task: Define OpenAI-compatible error response structures [ff5cef0]
+    - [x] Create shared error structs in `proxy.rs` or `comfyui.rs`
 - [ ] Task: Map ComfyUI backend errors to OpenAI format
     - [ ] Write tests for backend error translation
     - [ ] Update `comfyui.rs` to handle and transform errors from Reqwest and WebSocket
