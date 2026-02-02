@@ -1,9 +1,9 @@
 # Implementation Plan: Enhanced Error Handling and Request Validation
 
 ## Phase 1: Request Validation
-- [ ] Task: Implement validation logic for Image Generation requests
-    - [ ] Write unit tests for generation request validation
-    - [ ] Implement validation in `proxy.rs` or a dedicated module
+- [x] Task: Implement validation logic for Image Generation requests [73805a9]
+    - [x] Write unit tests for generation request validation
+    - [x] Implement validation in `proxy.rs` or a dedicated module
 - [ ] Task: Implement validation logic for Image Edit (img2img) requests
     - [ ] Write unit tests for edit request validation
     - [ ] Implement validation and base64 format checking
