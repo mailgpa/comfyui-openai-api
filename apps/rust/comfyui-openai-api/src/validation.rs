@@ -137,4 +137,49 @@ mod tests {
         };
         assert!(validate_generation_request(&req).is_err());
     }
+
+    #[test]
+    fn test_validate_edit_request_valid() {
+        let req = EditImageRequest {
+            model: "test-model".to_string(),
+            prompt: "a valid prompt".to_string(),
+            image: "base64data".to_string(),
+            mask: None,
+            n: Some(1),
+            size: "1024x1024".to_string(),
+            negative_prompt: None,
+        };
+        assert!(validate_edit_request(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_edit_request_empty_image() {
+        let req = EditImageRequest {
+            model: "test-model".to_string(),
+            prompt: "test".to_string(),
+            image: "".to_string(),
+            mask: None,
+            n: Some(1),
+            size: "1024x1024".to_string(),
+            negative_prompt: None,
+        };
+        match validate_edit_request(&req) {
+            Err(ProxyError::Validation(msg)) => assert_eq!(msg, "Image data cannot be empty"),
+            _ => panic!("Expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_edit_request_invalid_size() {
+         let req = EditImageRequest {
+            model: "test-model".to_string(),
+            prompt: "test".to_string(),
+            image: "data".to_string(),
+            mask: None,
+            n: Some(1),
+            size: "invalid".to_string(),
+            negative_prompt: None,
+        };
+        assert!(validate_edit_request(&req).is_err());
+    }
 }
