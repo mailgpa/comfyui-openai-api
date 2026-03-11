@@ -11,7 +11,9 @@ use axum::{
     response::Response as AxumResponse,
 };
 use base64::{Engine as _, engine::general_purpose};
+use futures::stream;
 use log::{debug, error, info, warn};
+use multer::Multipart;
 use rand::Rng;
 use reqwest::{Client, multipart};
 use serde::Serialize;
@@ -201,8 +203,7 @@ async fn process_generation_request(
         }
     };
 
-    let openai_request: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))?;
+    let openai_request = parse_openai_request(&body_bytes, &headers, require_image).await?;
 
     let mut base_image_name: Option<String> = None;
 
@@ -411,10 +412,15 @@ async fn create_json_payload(
                             // Integer primitive nodes (ComfyLiterals 'Int')
                             "Int" => {
                                 // Prefer to identify the primitive by the node's _meta.title if present
-                                let title_lower = node_data.get("_meta").and_then(|m| m.get("title")).and_then(|t| t.as_str()).map(|s| s.to_lowercase());
+                                let title_lower = node_data
+                                    .get("_meta")
+                                    .and_then(|m| m.get("title"))
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.to_lowercase());
                                 let key_lower = node_key.to_lowercase();
-                                if let Some(inputs_obj) = node_data.get_mut("inputs").and_then(|v| v.as_object_mut()) {
-
+                                if let Some(inputs_obj) =
+                                    node_data.get_mut("inputs").and_then(|v| v.as_object_mut())
+                                {
                                     // Helper to set the first numeric-like field in the inputs object
                                     let mut set_first_numeric = |val: String| {
                                         for (_k, v) in inputs_obj.iter_mut() {
@@ -426,29 +432,61 @@ async fn create_json_payload(
                                     };
 
                                     // Seed
-                                    if title_lower.as_deref() == Some("seed") || key_lower == "seed" {
-                                        let seed_value = openai_request.get("seed").and_then(|v| v.as_i64()).map(|s| s as i64).unwrap_or_else(|| rng.random_range(0..1_000_000) as i64);
-                                        debug!("✏️ Injecting seed into Int node '{}': {}", node_key, seed_value);
+                                    if title_lower.as_deref() == Some("seed") || key_lower == "seed"
+                                    {
+                                        let seed_value = openai_request
+                                            .get("seed")
+                                            .and_then(|v| v.as_i64())
+                                            .map(|s| s as i64)
+                                            .unwrap_or_else(|| {
+                                                rng.random_range(0..1_000_000) as i64
+                                            });
+                                        debug!(
+                                            "✏️ Injecting seed into Int node '{}': {}",
+                                            node_key, seed_value
+                                        );
                                         set_first_numeric(seed_value.to_string());
                                     }
-
                                     // Width / Height
-                                    else if title_lower.as_deref() == Some("width") || title_lower.as_deref() == Some("height") || key_lower == "width" || key_lower == "height" {
-                                        if let Some(size_data) = openai_request.get("size").and_then(|v| v.as_str()) {
+                                    else if title_lower.as_deref() == Some("width")
+                                        || title_lower.as_deref() == Some("height")
+                                        || key_lower == "width"
+                                        || key_lower == "height"
+                                    {
+                                        if let Some(size_data) =
+                                            openai_request.get("size").and_then(|v| v.as_str())
+                                        {
                                             if let Some((w, h)) = parse_size(size_data) {
-                                                let inject_value = if title_lower.as_deref() == Some("width") || key_lower == "width" { w } else { h };
-                                                debug!("✏️ Injecting {} into Int node '{}'", inject_value, node_key);
+                                                let inject_value = if title_lower.as_deref()
+                                                    == Some("width")
+                                                    || key_lower == "width"
+                                                {
+                                                    w
+                                                } else {
+                                                    h
+                                                };
+                                                debug!(
+                                                    "✏️ Injecting {} into Int node '{}'",
+                                                    inject_value, node_key
+                                                );
                                                 set_first_numeric(inject_value.to_string());
                                             } else {
                                                 warn!("⚠️ Invalid size format for {}", node_key);
                                             }
                                         }
                                     }
-
                                     // Batch size / copies
-                                    else if title_lower.as_deref() == Some("batch_size") || key_lower == "batch_size" || key_lower == "copies" {
-                                        if let Some(copies_num_data) = openai_request.get("n").and_then(|v| v.as_i64()) {
-                                            debug!("✏️ Injecting copies into Int node '{}': {}", node_key, copies_num_data);
+                                    else if title_lower.as_deref() == Some("batch_size")
+                                        || key_lower == "batch_size"
+                                        || key_lower == "copies"
+                                    {
+                                        if let Some(copies_num_data) =
+                                            openai_request.get("n").and_then(|v| v.as_i64())
+                                        {
+                                            debug!(
+                                                "✏️ Injecting copies into Int node '{}': {}",
+                                                node_key, copies_num_data
+                                            );
                                             set_first_numeric(copies_num_data.to_string());
                                         }
                                     }
@@ -458,32 +496,66 @@ async fn create_json_payload(
                             // String primitive nodes (ComfyLiterals 'String' or String-literal types)
                             ct if ct.to_lowercase().contains("string") => {
                                 // Prefer title for semantic meaning (e.g., "Positive Prompt", "Negative Prompt")
-                                let title_lower = node_data.get("_meta").and_then(|m| m.get("title")).and_then(|t| t.as_str()).map(|s| s.to_lowercase());
+                                let title_lower = node_data
+                                    .get("_meta")
+                                    .and_then(|m| m.get("title"))
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.to_lowercase());
                                 let key_lower = node_key.to_lowercase();
 
-                                if let Some(inputs_obj) = node_data.get_mut("inputs").and_then(|v| v.as_object_mut()) {
-                                    let is_prompt_like = title_lower.as_deref().map(|t| t.contains("prompt") || t.contains("positive") || t.contains("negative")).unwrap_or(false) || key_lower.contains("prompt") || key_lower.contains("text");
+                                if let Some(inputs_obj) =
+                                    node_data.get_mut("inputs").and_then(|v| v.as_object_mut())
+                                {
+                                    let is_prompt_like = title_lower
+                                        .as_deref()
+                                        .map(|t| {
+                                            t.contains("prompt")
+                                                || t.contains("positive")
+                                                || t.contains("negative")
+                                        })
+                                        .unwrap_or(false)
+                                        || key_lower.contains("prompt")
+                                        || key_lower.contains("text");
 
                                     if is_prompt_like {
                                         // Decide positive vs negative by title or node name
-                                        let is_negative = title_lower.as_deref().map(|t| t.contains("neg") || t.contains("negative")).unwrap_or(false) || key_lower.contains("neg");
+                                        let is_negative = title_lower
+                                            .as_deref()
+                                            .map(|t| t.contains("neg") || t.contains("negative"))
+                                            .unwrap_or(false)
+                                            || key_lower.contains("neg");
 
                                         if is_negative {
-                                            if let Some(neg_prompt_input) = openai_request.get("negative_prompt").and_then(|v| v.as_str()) {
-                                                debug!("✏️ Injecting negative prompt into String node '{}': {}", node_key, neg_prompt_input);
+                                            if let Some(neg_prompt_input) = openai_request
+                                                .get("negative_prompt")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                debug!(
+                                                    "✏️ Injecting negative prompt into String node '{}': {}",
+                                                    node_key, neg_prompt_input
+                                                );
                                                 for (_k, v) in inputs_obj.iter_mut() {
                                                     if v.is_string() {
-                                                        *v = Value::String(neg_prompt_input.to_string());
+                                                        *v = Value::String(
+                                                            neg_prompt_input.to_string(),
+                                                        );
                                                         break;
                                                     }
                                                 }
                                             }
                                         } else {
-                                            if let Some(prompt_input) = openai_request.get("prompt").and_then(|v| v.as_str()) {
-                                                debug!("✏️ Injecting prompt into String node '{}': {}", node_key, prompt_input);
+                                            if let Some(prompt_input) = openai_request
+                                                .get("prompt")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                debug!(
+                                                    "✏️ Injecting prompt into String node '{}': {}",
+                                                    node_key, prompt_input
+                                                );
                                                 for (_k, v) in inputs_obj.iter_mut() {
                                                     if v.is_string() {
-                                                        *v = Value::String(prompt_input.to_string());
+                                                        *v =
+                                                            Value::String(prompt_input.to_string());
                                                         break;
                                                     }
                                                 }
@@ -497,8 +569,14 @@ async fn create_json_payload(
                             "LoadImage" => {
                                 if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
                                     if let Some(image_name) = base_image {
-                                        debug!("✏️ Using uploaded image (LoadImage): {}", image_name);
-                                        inputs_data.insert("image".to_string(), Value::String(image_name.to_string()));
+                                        debug!(
+                                            "✏️ Using uploaded image (LoadImage): {}",
+                                            image_name
+                                        );
+                                        inputs_data.insert(
+                                            "image".to_string(),
+                                            Value::String(image_name.to_string()),
+                                        );
                                     } else {
                                         debug!("No base image provided, using workflow default");
                                     }
@@ -516,21 +594,44 @@ async fn create_json_payload(
                             if let Some(meta_data) = node_data["_meta"].as_object() {
                                 if let Some(title) = meta_data["title"].as_str() {
                                     if title == "Positive Prompt" {
-                                        if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
-                                            if let Some(prompt_input) = openai_request.get("prompt").and_then(|v| v.as_str()) {
+                                        if let Some(inputs_data) =
+                                            node_data["inputs"].as_object_mut()
+                                        {
+                                            if let Some(prompt_input) = openai_request
+                                                .get("prompt")
+                                                .and_then(|v| v.as_str())
+                                            {
                                                 debug!("✏️ Requested prompt: {}", prompt_input);
-                                                inputs_data.insert("text".to_string(), Value::String(prompt_input.to_string()));
+                                                inputs_data.insert(
+                                                    "text".to_string(),
+                                                    Value::String(prompt_input.to_string()),
+                                                );
                                             } else {
-                                                return Err(ProxyError::Json(format!("Failed to get prompt from JSON")));
+                                                return Err(ProxyError::Json(format!(
+                                                    "Failed to get prompt from JSON"
+                                                )));
                                             }
                                         }
                                     } else if title == "Negative Prompt" {
-                                        if let Some(inputs_data) = node_data["inputs"].as_object_mut() {
-                                            if let Some(neg_prompt_input) = openai_request.get("negative_prompt").and_then(|v| v.as_str()) {
-                                                debug!("✏️ Requested negative prompt: {}", neg_prompt_input);
-                                                inputs_data.insert("text".to_string(), Value::String(neg_prompt_input.to_string()));
+                                        if let Some(inputs_data) =
+                                            node_data["inputs"].as_object_mut()
+                                        {
+                                            if let Some(neg_prompt_input) = openai_request
+                                                .get("negative_prompt")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                debug!(
+                                                    "✏️ Requested negative prompt: {}",
+                                                    neg_prompt_input
+                                                );
+                                                inputs_data.insert(
+                                                    "text".to_string(),
+                                                    Value::String(neg_prompt_input.to_string()),
+                                                );
                                             } else {
-                                                debug!("No negative_prompt in JSON, using workflow default");
+                                                debug!(
+                                                    "No negative_prompt in JSON, using workflow default"
+                                                );
                                             }
                                         }
                                     }
@@ -554,6 +655,133 @@ async fn create_json_payload(
         .map_err(|e| ProxyError::Json(format!("Failed to serialize JSON: {}", e)))?;
 
     Ok(Bytes::from(modified_json))
+}
+
+/// Parses the incoming OpenAI request body.
+///
+/// `/v1/images/edits` accepts either JSON (`image` as base64) or multipart/form-data
+/// (`image` as file upload), which is normalized into the same JSON shape for the
+/// downstream validation and workflow transformation logic.
+async fn parse_openai_request(
+    body_bytes: &Bytes,
+    headers: &HeaderMap,
+    require_image: bool,
+) -> Result<Value, ProxyError> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    let is_multipart = content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/form-data");
+
+    if require_image && is_multipart {
+        return parse_multipart_edit_request(body_bytes.clone(), content_type).await;
+    }
+
+    serde_json::from_slice(body_bytes)
+        .map_err(|e| ProxyError::Json(format!("Failed to parse JSON: {}", e)))
+}
+
+fn is_image_field(field_name: &str) -> bool {
+    field_name == "image" || field_name == "image[]" || field_name.starts_with("image[")
+}
+
+fn is_mask_field(field_name: &str) -> bool {
+    field_name == "mask" || field_name == "mask[]" || field_name.starts_with("mask[")
+}
+
+/// Parses multipart edits requests into the existing OpenAI JSON request shape.
+async fn parse_multipart_edit_request(
+    body_bytes: Bytes,
+    content_type: &str,
+) -> Result<Value, ProxyError> {
+    let boundary = multer::parse_boundary(content_type)
+        .map_err(|e| ProxyError::Json(format!("Invalid multipart boundary: {}", e)))?;
+
+    let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
+    let mut multipart = Multipart::new(stream, boundary);
+
+    let mut payload = serde_json::Map::new();
+    let mut image_data: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ProxyError::Json(format!("Failed to parse multipart field: {}", e)))?
+    {
+        let field_name = match field.name() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        let is_file = field.file_name().is_some();
+        let field_bytes = field.bytes().await.map_err(|e| {
+            ProxyError::Json(format!("Failed to read multipart field bytes: {}", e))
+        })?;
+
+        if is_image_field(&field_name) {
+            if image_data.is_none() {
+                if is_file {
+                    image_data = Some(general_purpose::STANDARD.encode(&field_bytes));
+                } else {
+                    let text_value = String::from_utf8(field_bytes.to_vec()).map_err(|e| {
+                        ProxyError::Json(format!("Invalid UTF-8 in image field: {}", e))
+                    })?;
+                    image_data = Some(text_value.trim().to_string());
+                }
+            } else {
+                debug!(
+                    "Received additional multipart image field '{}'; ignoring it",
+                    field_name
+                );
+            }
+            continue;
+        }
+
+        if is_mask_field(&field_name) {
+            debug!(
+                "Mask field '{}' received but ignored (not supported yet)",
+                field_name
+            );
+            continue;
+        }
+
+        let text_value = String::from_utf8(field_bytes.to_vec()).map_err(|e| {
+            ProxyError::Json(format!(
+                "Invalid UTF-8 in multipart field '{}': {}",
+                field_name, e
+            ))
+        })?;
+        let text_value = text_value.trim();
+
+        if text_value.is_empty() {
+            continue;
+        }
+
+        if field_name == "n" {
+            let parsed = text_value.parse::<u64>().map_err(|_| {
+                ProxyError::Validation("Field 'n' must be a positive integer".to_string())
+            })?;
+            payload.insert("n".to_string(), Value::Number(parsed.into()));
+            continue;
+        }
+
+        payload.insert(field_name, Value::String(text_value.to_string()));
+    }
+
+    if let Some(image) = image_data {
+        payload.insert("image".to_string(), Value::String(image));
+    }
+
+    if !payload.contains_key("image") {
+        return Err(ProxyError::Validation(
+            "Multipart edits requests must include an image file or image field".to_string(),
+        ));
+    }
+
+    Ok(Value::Object(payload))
 }
 
 /// Decodes a base64-encoded image string, accepting optional data URLs.
@@ -658,6 +886,34 @@ async fn handle_regular_response(
         .map_err(|e| ProxyError::Upstream(format!("Failed to read response body: {}", e)))?;
 
     debug!("📥 Response body: {} bytes", body_bytes.len());
+
+    // Handle non-success status codes
+    if !status.is_success() {
+        let error_msg = String::from_utf8_lossy(&body_bytes);
+        error!(
+            "❌ ComfyUI backend returned error status {}: {}",
+            status, error_msg
+        );
+
+        // Try to parse as JSON to get more details
+        if let Ok(json_error) = serde_json::from_slice::<Value>(&body_bytes) {
+            if let Some(error_detail) = json_error
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                return Err(ProxyError::Upstream(format!(
+                    "ComfyUI error: {}",
+                    error_detail
+                )));
+            }
+        }
+
+        return Err(ProxyError::Upstream(format!(
+            "ComfyUI backend returned error status {}",
+            status
+        )));
+    }
 
     // Parse backend response as JSON
     let json: Value = serde_json::from_slice(&body_bytes)
@@ -834,10 +1090,23 @@ async fn retrieve_image_from_history(
         }
     };
 
-    // Parse history response
+    let status = upstream_response.status();
     let response_body = upstream_response.bytes().await.map_err(|e| {
         ProxyError::Upstream(format!("Failed to read history response body: {}", e))
     })?;
+
+    if !status.is_success() {
+        let error_msg = String::from_utf8_lossy(&response_body);
+        error!(
+            "❌ ComfyUI history returned error status {}: {}",
+            status, error_msg
+        );
+        return Err(ProxyError::Upstream(format!(
+            "ComfyUI history error (status {})",
+            status
+        )));
+    }
+
     let history_json: Value = serde_json::from_slice(&response_body)
         .map_err(|e| ProxyError::Json(format!("Failed to parse history JSON: {}", e)))?;
 
@@ -1022,11 +1291,24 @@ async fn check_queue(
         }
     };
 
-    // Parse history response
+    let status = upstream_response.status();
     let response_body = upstream_response
         .bytes()
         .await
         .map_err(|e| ProxyError::Upstream(format!("Failed to read queu response body: {}", e)))?;
+
+    if !status.is_success() {
+        let error_msg = String::from_utf8_lossy(&response_body);
+        error!(
+            "❌ ComfyUI queue returned error status {}: {}",
+            status, error_msg
+        );
+        return Err(ProxyError::Upstream(format!(
+            "ComfyUI queue error (status {})",
+            status
+        )));
+    }
+
     let queu_json: Value = serde_json::from_slice(&response_body)
         .map_err(|e| ProxyError::Json(format!("Failed to queu history JSON: {}", e)))?;
 
@@ -1057,5 +1339,145 @@ fn parse_size(size_data: &str) -> Option<(i32, i32)> {
     match (parts.next(), parts.next()) {
         (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[tokio::test]
+    async fn multipart_edits_parses_image_and_fields() {
+        let boundary = "----codex-boundary";
+        let content_type = format!("multipart/form-data; boundary={}", boundary);
+        let body = format!(
+            "--{b}\r\n\
+Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+animagine-xl-4\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+a cat wearing sunglasses\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"size\"\r\n\r\n\
+1024x1024\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"n\"\r\n\r\n\
+2\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\n\
+Content-Type: image/png\r\n\r\n\
+PNGDATA\r\n\
+--{b}--\r\n",
+            b = boundary
+        );
+
+        let parsed = parse_multipart_edit_request(Bytes::from(body), &content_type)
+            .await
+            .expect("multipart should parse");
+
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("animagine-xl-4")
+        );
+        assert_eq!(
+            parsed.get("prompt").and_then(|v| v.as_str()),
+            Some("a cat wearing sunglasses")
+        );
+        assert_eq!(
+            parsed.get("size").and_then(|v| v.as_str()),
+            Some("1024x1024")
+        );
+        assert_eq!(parsed.get("n").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            parsed.get("image").and_then(|v| v.as_str()),
+            Some(general_purpose::STANDARD.encode("PNGDATA").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_edits_requires_image_field() {
+        let boundary = "----codex-boundary";
+        let content_type = format!("multipart/form-data; boundary={}", boundary);
+        let body = format!(
+            "--{b}\r\n\
+Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+animagine-xl-4\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+a cat wearing sunglasses\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"size\"\r\n\r\n\
+1024x1024\r\n\
+--{b}--\r\n",
+            b = boundary
+        );
+
+        let result = parse_multipart_edit_request(Bytes::from(body), &content_type).await;
+        assert!(matches!(result, Err(ProxyError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn multipart_edits_ignores_mask_field() {
+        let boundary = "----codex-boundary";
+        let content_type = format!("multipart/form-data; boundary={}", boundary);
+        let body = format!(
+            "--{b}\r\n\
+Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+animagine-xl-4\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+a cat wearing sunglasses\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"size\"\r\n\r\n\
+1024x1024\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\n\
+Content-Type: image/png\r\n\r\n\
+MASKDATA\r\n\
+--{b}\r\n\
+Content-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\n\
+Content-Type: image/png\r\n\r\n\
+PNGDATA\r\n\
+--{b}--\r\n",
+            b = boundary
+        );
+
+        let parsed = parse_multipart_edit_request(Bytes::from(body), &content_type)
+            .await
+            .expect("multipart should parse");
+
+        assert!(parsed.get("mask").is_none());
+        assert!(parsed.get("image").is_some());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_request_keeps_json_for_edits() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let body = Bytes::from_static(
+            br#"{"model":"animagine-xl-4","prompt":"a cat","image":"UE5HREFUQQ==","size":"1024x1024"}"#,
+        );
+
+        let parsed = parse_openai_request(&body, &headers, true)
+            .await
+            .expect("json request should parse");
+
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("animagine-xl-4")
+        );
+        assert_eq!(parsed.get("prompt").and_then(|v| v.as_str()), Some("a cat"));
+        assert_eq!(
+            parsed.get("size").and_then(|v| v.as_str()),
+            Some("1024x1024")
+        );
+        assert_eq!(
+            parsed.get("image").and_then(|v| v.as_str()),
+            Some("UE5HREFUQQ==")
+        );
     }
 }
