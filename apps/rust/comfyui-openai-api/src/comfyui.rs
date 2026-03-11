@@ -3,9 +3,6 @@
 //! This module handles the translation between OpenAI API format and ComfyUI format,
 //! manages image generation requests, and retrieves generated images from the backend.
 
-use crate::validation::{
-    EditImageRequest, GenerateImageRequest, validate_edit_request, validate_generation_request,
-};
 use crate::ws::WebSocketManager;
 use axum::{
     body::{Body, Bytes},
@@ -207,19 +204,6 @@ async fn process_generation_request(
     };
 
     let openai_request = parse_openai_request(&body_bytes, &headers, require_image).await?;
-
-    // Validate request
-    if require_image {
-        let req: EditImageRequest = serde_json::from_value(openai_request.clone())
-            .map_err(|e| ProxyError::Validation(format!("Invalid edit request format: {}", e)))?;
-        validate_edit_request(&req)?;
-    } else {
-        let req: GenerateImageRequest =
-            serde_json::from_value(openai_request.clone()).map_err(|e| {
-                ProxyError::Validation(format!("Invalid generation request format: {}", e))
-            })?;
-        validate_generation_request(&req)?;
-    }
 
     let mut base_image_name: Option<String> = None;
 

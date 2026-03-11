@@ -16,7 +16,6 @@ mod config;
 mod proxy;
 mod comfyui;
 mod ws;
-mod validation;
 
 use axum::{routing::any, routing::get, Router};
 use log::info;

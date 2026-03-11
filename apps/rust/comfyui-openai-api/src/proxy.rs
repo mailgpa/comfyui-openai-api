@@ -56,8 +56,6 @@ pub enum ProxyError {
     Internal(String),
     /// Upstream/backend errors (502)
     Upstream(String),
-    /// Timeout errors (504)
-    Timeout(String),
     /// JSON parsing/serialization errors (400)
     Json(String),
     /// Request validation errors (400)
@@ -67,25 +65,13 @@ pub enum ProxyError {
     Implementation(String),
 }
 
-/// Error details in OpenAI format
-#[derive(Serialize)]
-struct OpenAIErrorDetails {
-    /// Error message
-    message: String,
-    /// Type of error (e.g., "invalid_request_error")
-    #[serde(rename = "type")]
-    error_type: String,
-    /// Parameter that caused the error (if any)
-    param: Option<String>,
-    /// Error code (e.g., "model_not_found")
-    code: Option<String>,
-}
-
-/// HTTP response body for error messages in OpenAI format
+/// HTTP response body for error messages
 #[derive(Serialize)]
 struct ErrorResponse {
-    /// Nested error details
-    error: OpenAIErrorDetails,
+    /// HTTP status code
+    code: u32,
+    /// Error message
+    message: String,
 }
 
 /// Response payload for the health endpoint
@@ -104,40 +90,32 @@ pub struct HealthResponse {
 /// Converts ProxyError into an HTTP response with appropriate status code and JSON body
 impl IntoResponse for ProxyError {
     fn into_response(self) -> AxumResponse {
-        let (status, error_type, message, code) = match self {
+        let (status, _code, message) = match self {
             ProxyError::Internal(msg) => {
                 error!("❌ Internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", msg, None)
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg)
             }
             ProxyError::Upstream(msg) => {
                 error!("❌ Upstream error: {}", msg);
-                (StatusCode::BAD_GATEWAY, "upstream_error", msg, None)
-            }
-            ProxyError::Timeout(msg) => {
-                error!("❌ Timeout error: {}", msg);
-                (StatusCode::GATEWAY_TIMEOUT, "request_timeout", msg, None)
+                (StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", msg)
             }
             ProxyError::Json(msg) => {
                 error!("❌ JSON error: {}", msg);
-                (StatusCode::BAD_REQUEST, "invalid_request_error", msg, Some("invalid_json".to_string()))
+                (StatusCode::BAD_REQUEST, "JSON_ERROR", msg)
             }
             ProxyError::Validation(msg) => {
                 error!("❌ Validation error: {}", msg);
-                (StatusCode::BAD_REQUEST, "invalid_request_error", msg, Some("validation_failed".to_string()))
+                (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", msg)
             }
             ProxyError::Implementation(msg) => {
                 error!("❌ Implementation error: {}", msg);
-                (StatusCode::BAD_REQUEST, "invalid_request_error", msg, Some("not_implemented".to_string()))
+                (StatusCode::BAD_REQUEST, "IMPLEMENTATION_ERROR", msg)
             }
         };
 
         let error_response = ErrorResponse {
-            error: OpenAIErrorDetails {
-                message,
-                error_type: error_type.to_string(),
-                param: None,
-                code,
-            },
+            code: status.as_u16() as u32,
+            message,
         };
 
         (status, axum::Json(error_response)).into_response()
@@ -188,7 +166,7 @@ pub fn handle_timeout_error(full_url: &str, timeout_duration: Duration) -> Proxy
         "❌ Request timed out after {} seconds",
         timeout_duration.as_secs()
     );
-    ProxyError::Timeout(format!(
+    ProxyError::Upstream(format!(
         "Request hung/timed out after {} seconds to {}",
         timeout_duration.as_secs(),
         full_url
