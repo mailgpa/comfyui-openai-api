@@ -9,7 +9,7 @@ A high-performance reverse proxy that translates OpenAI image generation API cal
 This proxy serves as a bridge between OpenAI API-compatible clients and ComfyUI. It:
 
 - **Accepts** standard OpenAI image generation requests (`POST /v1/images/generations`)
-- **Supports** OpenAI-compatible img2img requests (`POST /v1/images/edits` with a base64 `image` field)
+- **Supports** OpenAI-compatible img2img requests (`POST /v1/images/edits` via JSON base64 or multipart file upload)
 - **Translates** OpenAI parameters to ComfyUI workflow format
 - **Manages** job execution via persistent WebSocket connection
 - **Retrieves** generated images from ComfyUI backend
@@ -252,10 +252,15 @@ print(response.data[0].b64_json)
 
 ### Image-to-Image (img2img)
 
-Send `POST /v1/images/edits` with the same JSON fields as `generations` plus an
-`image` key containing a base64-encoded source image (data URLs are supported).
+Send `POST /v1/images/edits` with the same fields as `generations` plus an
+`image` input. Supported formats:
+
+- `application/json`: provide `image` as base64 (data URLs are supported).
+- `multipart/form-data`: provide `image` as a file field plus text fields like
+  `model`, `prompt`, `size`, and optional `n`.
+
 Workflows that include a **LoadImage** node will receive the uploaded file
-automatically.
+automatically. `mask` fields are currently ignored.
 
 ## Workflow Management
 
@@ -358,4 +363,3 @@ Contributions are welcome. Please follow these guidelines:
 - Update documentation for user-facing changes
 - Test with various workflow configurations
 - Report bugs with reproduction steps
-
